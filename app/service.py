@@ -37,6 +37,10 @@ async def ingest_vod(app: App, info: VodInfo) -> int:
         vod = Vod(
             id=info.id, streamer_id=streamer.id, title=info.title, started_at=info.started_at, duration=info.duration
         )
+        # Между моделями нет relationship, и без явного flush SQLAlchemy может вставить
+        # сегменты раньше VOD — тогда SQLite отвергнет их по внешнему ключу
+        session.add(vod)
+        await session.flush()
         segments = [
             Segment(
                 vod_id=info.id,
@@ -50,7 +54,6 @@ async def ingest_vod(app: App, info: VodInfo) -> int:
             )
             for i, p in enumerate(planned, 1)
         ]
-        session.add(vod)
         session.add_all(segments)
 
     await app.notify(render_vod_header(vod, streamer, len(segments), app.tz))
