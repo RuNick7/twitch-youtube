@@ -1,0 +1,16 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    init: true  # подбирает завершившиеся процессы yt-dlp и ffmpeg
+    env_file: .env
+    volumes:
+      - ./data:/data
+    # На сервере 1 vCPU и 2 ГБ, часть уже занята другими сервисами
+    mem_limit: 768m
+    cpus: 0.6
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
