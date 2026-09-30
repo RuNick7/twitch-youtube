@@ -51,10 +51,16 @@ Swap на 2 ГБ, если `swapon --show` ничего не выводит:
 fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /etc/fstab
 ```
 
-Скопируйте проект на сервер. Команда запускается на вашем компьютере из папки проекта:
+Скачайте проект с GitHub (если git не установлен: `apt install -y git`). Репозиторий приватный, поэтому сервер входит по ключу развёртывания (deploy key) с правом только на чтение. Если ключа ещё нет, создайте его на сервере и добавьте выведенную строку в настройках репозитория: Settings → Deploy keys → Add deploy key.
 
 ```bash
-rsync -av --exclude data --exclude .env --exclude __pycache__ ./ root@IP_СЕРВЕРА:/opt/twitch-youtube/
+ssh-keygen -t ed25519 -f ~/.ssh/twitch_youtube -N "" && cat ~/.ssh/twitch_youtube.pub
+```
+
+Клонирование. Ключ запоминается в настройках копии, поэтому потом `git pull` работает без лишних параметров:
+
+```bash
+git clone -c core.sshCommand="ssh -i ~/.ssh/twitch_youtube -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" git@github.com:RuNick7/twitch-youtube.git /opt/twitch-youtube
 ```
 
 На сервере создайте `.env` из шаблона и заполните его:
@@ -95,7 +101,7 @@ docker compose up -d --build
 ## Обслуживание
 
 - Логи: `docker compose logs -f app`
-- Обновление кода: повторите `rsync` и выполните `docker compose up -d --build`.
+- Обновление кода: `cd /opt/twitch-youtube && git pull && docker compose up -d --build`.
 - yt-dlp обновляется сам при каждом старте контейнера и раз в сутки.
 - Данные лежат в `./data`: база `app.db` и временные файлы `work/`. Файл сегмента удаляется сразу после загрузки.
 
