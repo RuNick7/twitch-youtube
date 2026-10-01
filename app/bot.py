@@ -11,9 +11,11 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, Message
+from sqlalchemy import func, select
 
+from . import consent
 from .context import App
-from .db import Segment, Status, Vod, find_streamer, get_streamer, utcnow
+from .db import Playlist, Segment, Status, Vod, find_streamer, get_streamer, utcnow
 from .segments import is_short_reason, parse_vod_id
 from .service import (
     DISCONNECTED_REASON,
@@ -22,11 +24,13 @@ from .service import (
     forget_youtube,
     ingest_vod,
     publish,
+    queue_skipped,
     set_status,
     status_counts,
 )
 from .tools import ToolError, fetch_vod_info
 from .ui import (
+    ACCEPT,
     CANCEL,
     CONNECT,
     DISCONNECT,
@@ -145,6 +149,7 @@ async def connect_youtube(message: Message, app: App) -> None:
 async def accept_and_connect(query: CallbackQuery, app: App) -> None:
     await query.answer()
     await _drop_buttons(query)
+    await consent.accept(app)
     try:
         code = await app.youtube.start_device_flow()
     except (YouTubeError, httpx.HTTPError) as exc:
@@ -174,6 +179,14 @@ async def _finish_youtube(app: App, code: DeviceCode, prompt: Message) -> None:
         streamer.youtube_channel_title = title
     paused = "\nОбработка на паузе: /resume — продолжить." if await is_paused(app) else ""
     await prompt.edit_text(f"✅ Подключён канал «{escape(title)}»{paused}")
+
+
+@owner.callback_query(YouTubeAction.filter(F.action == ACCEPT))
+async def accept_policy(query: CallbackQuery, app: App) -> None:
+    """Согласие с обновлённой политикой без повторного входа в Google."""
+    await consent.accept(app)
+    await query.answer("Принято: плейлисты включены")
+    await _drop_buttons(query)
 
 
 @owner.message(Command("disconnect"))
@@ -256,6 +269,16 @@ async def show_status(message: Message, app: App) -> None:
         if settings.auto_publish
         else "выключена"
     )
+    async with app.sessions() as session:
+        playlist_count = await session.scalar(select(func.count()).select_from(Playlist))
+    if not settings.playlists:
+        playlists = "выключены (PLAYLISTS=false)"
+    elif not (streamer and streamer.youtube_token):
+        playlists = "YouTube-канал не подключён"
+    elif await consent.accepted_version(app) < consent.CONSENT_VERSION:
+        playlists = "ждут согласия с обновлённой политикой конфиденциальности"
+    else:
+        playlists = f"по категориям, создано {playlist_count}"
     await message.answer(
         "\n".join(
             [
@@ -264,6 +287,7 @@ async def show_status(message: Message, app: App) -> None:
                 f"YouTube: {youtube}",
                 f"Обработка: {'⏸ на паузе, /resume — продолжить' if paused else '▶️ работает'}",
                 f"Автопубликация: {publishing}",
+                f"Плейлисты: {playlists}",
                 f"Сегменты: {segments or 'пока нет'}",
                 f"Диск: свободно {disk.free / 1024**3:.0f} из {disk.total / 1024**3:.0f} ГБ",
                 f"yt-dlp: {escape(app.ytdlp_version)}",
@@ -327,9 +351,7 @@ async def force_upload(query: CallbackQuery, callback_data: SegmentAction, app: 
         seg = await session.get(Segment, callback_data.id)
     # Короткий сегмент не опасен и публикуется как обычно, а пропущенный фильтром сериалов — только по решению
     review = not (seg and is_short_reason(seg.reason))
-    changed = await set_status(
-        app, callback_data.id, (Status.SKIPPED,), Status.QUEUED, queued_at=utcnow(), force_review=review
-    )
+    changed = await queue_skipped(app, callback_data.id, review)
     answer = "Загружу, но опубликую только после вашего решения" if review else "Загружу"
     await query.answer(answer if changed else "Уже обработан")
     await app.refresh_segment(callback_data.id)

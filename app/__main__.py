@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from .bot import router
 from .checker import Checker
 from .config import Settings
+from .consent import prompt_update
 from .context import App
 from .crypto import Vault
 from .db import get_streamer, init_db, make_engine
@@ -86,6 +87,7 @@ async def main() -> None:
             log.warning("TELEGRAM_OWNER_ID не задан: напишите боту /start, чтобы узнать свой ID")
         else:
             await app.notify("🟢 Бот запущен", silent=True)
+            await prompt_update(app)
         try:
             await dispatcher.start_polling(bot)
         finally:

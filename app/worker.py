@@ -173,8 +173,12 @@ class Worker:
             if percent < 100 and (percent - shown["percent"] < 10 or now - shown["at"] < 5):
                 return
             shown.update(percent=percent, at=now)
-            await update_segment(app, seg.id, progress=percent)
-            await app.refresh_segment(seg.id)
+            try:
+                await update_segment(app, seg.id, progress=percent)
+                await app.refresh_segment(seg.id)
+            except Exception:
+                # Проценты — только для глаз: из-за них нельзя потерять уже загруженный ролик
+                log.warning("Не удалось сохранить прогресс сегмента %s", seg.id, exc_info=True)
 
         async def on_session(uri: str) -> None:
             await update_segment(app, seg.id, upload_uri=uri)

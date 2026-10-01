@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import BigInteger, ForeignKey, String, Text, event, select
+from sqlalchemy import BigInteger, ForeignKey, String, Text, UniqueConstraint, delete, event, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -71,8 +71,7 @@ class Segment(Base):
     start: Mapped[int]
     end: Mapped[int]
     category: Mapped[str] = mapped_column(String(256))
-    part: Mapped[int | None]
-    parts: Mapped[int | None]  # сколько частей у этой категории в стриме: «1/3»
+    part: Mapped[int | None]  # «Часть N»: номер сквозной по категории, от стрима к стриму
     title: Mapped[str] = mapped_column(String(256))
     stream_title: Mapped[str | None] = mapped_column(Text)  # название стрима на этом отрезке
     ranges: Mapped[str | None] = mapped_column(Text)  # JSON [[start, end], …], если ролик склеен из отрезков
@@ -90,8 +89,22 @@ class Segment(Base):
     publish_after: Mapped[datetime | None]
     published_at: Mapped[datetime | None]
     monitor_until: Mapped[datetime | None]
+    playlist_added_at: Mapped[datetime | None]  # когда ролик добавлен в плейлист своей категории
     error: Mapped[str | None] = mapped_column(Text)
     tg_message_id: Mapped[int | None] = mapped_column(BigInteger)
+
+
+class Playlist(Base):
+    """Плейлист категории на YouTube-канале: создаётся при первом опубликованном ролике категории."""
+
+    __tablename__ = "playlists"
+    __table_args__ = (UniqueConstraint("streamer_id", "category"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    streamer_id: Mapped[int] = mapped_column(ForeignKey("streamers.id"))
+    category: Mapped[str] = mapped_column(String(256))  # category_key: без учёта регистра
+    youtube_id: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
 class TitleChange(Base):
@@ -132,12 +145,16 @@ def dump_warnings(warnings: list[str]) -> str | None:
 
 
 def make_engine(path: Path) -> AsyncEngine:
-    engine = create_async_engine(f"sqlite+aiosqlite:///{path}")
+    # Коммит может ждать диск, занятый другими процессами сервера: ждём блокировку до 30 секунд, а не 5
+    engine = create_async_engine(f"sqlite+aiosqlite:///{path}", connect_args={"timeout": 30})
 
     @event.listens_for(engine.sync_engine, "connect")
     def _sqlite_pragmas(connection, _record) -> None:
         cursor = connection.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
+        # В режиме WAL база не портится и без fsync на каждый коммит; при сбое питания
+        # могут пропасть только последние секунды изменений
+        cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()
 
@@ -187,3 +204,7 @@ async def kv_get(session: AsyncSession, key: str) -> str | None:
 
 async def kv_set(session: AsyncSession, key: str, value: str) -> None:
     await session.merge(KV(key=key, value=value))
+
+
+async def kv_delete(session: AsyncSession, key: str) -> None:
+    await session.execute(delete(KV).where(KV.key == key))

@@ -68,7 +68,18 @@ from aiogram.client.session.base import BaseSession  # noqa: E402
 from sqlalchemy import delete, select, update  # noqa: E402
 from sqlalchemy.ext.asyncio import async_sessionmaker  # noqa: E402
 
-from app.db import KV, Segment, Status, Streamer, TitleChange, Vod, get_spans, get_warnings, make_engine  # noqa: E402
+from app.db import (  # noqa: E402
+    KV,
+    Playlist,
+    Segment,
+    Status,
+    Streamer,
+    TitleChange,
+    Vod,
+    get_spans,
+    get_warnings,
+    make_engine,
+)
 from app.tools import VodInfo, fetch_vod_info  # noqa: E402
 from app.twitch import LiveState  # noqa: E402
 
@@ -90,6 +101,14 @@ RESULTS: list[tuple[bool, str]] = []
 def check(ok, name, detail=""):
     RESULTS.append((bool(ok), name))
     print(("  PASS  " if ok else "  FAIL  ") + name + ("" if ok or not detail else f"  <-- {detail}"), flush=True)
+
+
+async def eventually(pred, timeout=10.0):
+    """Значение pred, когда оно появится, или None: сообщение уходит чуть позже смены статуса в базе."""
+    try:
+        return await wait_for(pred, timeout)
+    except AssertionError:
+        return None
 
 
 async def wait_for(pred, timeout=240.0, what=""):
@@ -288,6 +307,8 @@ class FakeGoogle:
         self.revoked: set[str] = set()
         self.revoke_calls: list[str] = []
         self.channel_title = "Тестовый канал"
+        self.playlists: dict[str, dict] = {}
+        self.playlist_seq = 0
 
     def app(self):
         app = web.Application(client_max_size=64 * 1024**2)
@@ -297,6 +318,9 @@ class FakeGoogle:
         app.router.add_get("/youtube/v3/channels", self.channels)
         app.router.add_get("/youtube/v3/videos", self.list_videos)
         app.router.add_put("/youtube/v3/videos", self.update_video)
+        app.router.add_get("/youtube/v3/playlists", self.list_playlists)
+        app.router.add_post("/youtube/v3/playlists", self.create_playlist)
+        app.router.add_post("/youtube/v3/playlistItems", self.add_playlist_item)
         app.router.add_post("/upload/youtube/v3/videos", self.create)
         app.router.add_put("/upload/session/{sid}", self.put)
         return app
@@ -454,6 +478,45 @@ class FakeGoogle:
             v["published"] = st["privacyStatus"] == "public"
         return web.json_response({"id": body["id"], "status": {**st, "privacyStatus": v["privacy"]}})
 
+    async def list_playlists(self, request):
+        if (denied := self._auth(request)) is not None:
+            return denied
+        if request.query.get("mine") != "true":
+            self.violations.append(f"playlists.list {dict(request.query)}")
+        return web.json_response({"items": [{"id": pid} for pid in self.playlists]})
+
+    async def create_playlist(self, request):
+        if (denied := self._auth(request)) is not None:
+            return denied
+        body = await request.json()
+        snippet, status = body.get("snippet") or {}, body.get("status") or {}
+        if request.query.get("part") != "snippet,status" or not snippet.get("title") or "<" in snippet["title"]:
+            self.violations.append(f"playlists.insert {dict(request.query)} {body}")
+        self.playlist_seq += 1
+        pid = f"PL{self.playlist_seq}"
+        self.playlists[pid] = {"title": snippet.get("title"), "privacy": status.get("privacyStatus"), "items": []}
+        return web.json_response({"id": pid})
+
+    async def add_playlist_item(self, request):
+        if (denied := self._auth(request)) is not None:
+            return denied
+        snippet = (await request.json()).get("snippet") or {}
+        playlist = self.playlists.get(snippet.get("playlistId"))
+        video = (snippet.get("resourceId") or {}).get("videoId")
+        if playlist is None:
+            return web.json_response({"error": {"code": 404, "message": "Playlist not found",
+                                                "errors": [{"reason": "playlistNotFound"}]}}, status=404)
+        if video not in self.videos:
+            return web.json_response({"error": {"code": 404, "message": "Video not found",
+                                                "errors": [{"reason": "videoNotFound"}]}}, status=404)
+        if video in playlist["items"]:
+            self.violations.append(f"ролик {video} дважды добавлен в плейлист")
+        playlist["items"].append(video)
+        return web.json_response({"id": f"PLI-{video}"})
+
+    def playlist(self, prefix):
+        return next(((pid, p) for pid, p in self.playlists.items() if p["title"].startswith(prefix)), (None, None))
+
 
 # ---------- подставной список VOD канала для слежения ----------
 
@@ -608,14 +671,17 @@ async def main():
     reply = await say("/youtube")
     consent = reply[-1][0]
     text = tg.messages[consent]["text"]
-    check("приватными роликами" in text and "политикой" in text and "Условиями использования YouTube" in text
-          and "/disconnect" in text and tg.find("ABCD-EFGH") is None,
+    check("приватными роликами" in text and "плейлисты по категориям" in text and "политикой" in text
+          and "Условиями использования YouTube" in text and "/disconnect" in text and tg.find("ABCD-EFGH") is None,
           "до входа бот объясняет, что будет делать с каналом, и просит принять политику", text)
     await press(consent, "✅")
     mid = await wait_for(lambda: tg.find("ABCD-EFGH"), 30, "код")
     check(not tg.messages[consent]["markup"], "после согласия кнопки под условиями убраны")
     await wait_for(lambda: "Подключён канал" in tg.messages[mid]["text"], 30, "канал")
     check(True, "YouTube подключён по коду")
+    # Канал будто подключили до появления плейлистов: согласие дано по старой версии политики
+    async with db() as s, s.begin():
+        await s.execute(update(KV).where(KV.key == "consent_version").values(value="1"))
     reply = await say("/pause")
     check("остановлены" in reply[-1][1]["text"], "/pause")
 
@@ -646,6 +712,9 @@ async def main():
     async with db() as s:
         vod_n = await s.get(Vod, VOD_NORMAL)
     check(vod_n.playlist_url and vod_n.playlist_url.endswith("index-dvr.m3u8"), "плейлист VOD сохранён")
+    check(s_mc.title.endswith(" | Часть 1 | Заквиель") and n_mc.title.endswith(" | Часть 2 | Заквиель")
+          and n_jc.title.endswith(" | Заквиель") and n_jc.part is None,
+          "Minecraft нумеруется от стрима к стриму, Just Chatting — без номера", (s_mc.title, n_mc.title, n_jc.title))
 
     # Короткие отрезки вместо многочасовых, чтобы тест шёл минуты
     ranges = {s_mc.id: (1200, 1290), n_jc.id: (600, 690), n_mc.id: (3000, 3120)}
@@ -675,18 +744,32 @@ async def main():
     check(row.status == Status.UPLOADING and row.upload_uri and row.upload_total,
           f"«падение» посреди загрузки: принято {got / 1e6:.0f} из {row.upload_total / 1e6:.0f} МБ, сессия сохранена")
     sessions_before = len(google.sessions)
+    # Согласие дано по старой версии политики: после перезапуска бот просит принять новую
+    since = tg.next_message_id
     task = await start_app()
+    policy = await wait_for(lambda: tg.find("Политика конфиденциальности AutoVOD обновлена", since), 30, "новая политика")
+    check("плейлисты по категориям" in tg.messages[policy]["text"]
+          and buttons(tg.messages[policy]["markup"])[0] == "✅ Принимаю",
+          "после обновления политики бот просит принять её заново", tg.messages[policy]["text"][:200])
 
     print("\n== 6. Итоги загрузок и проверок", flush=True)
     finals = (Status.PUBLISHED, Status.REVIEW, Status.REJECTED, Status.LOCKED, Status.FAILED, Status.PRIVATE)
     row = await wait_for(lambda: status_in(s_mc.id, finals), 300, "S.MC")
     check(row.status == Status.REJECTED and "Content ID" in (row.reason or ""), "отклонённый YouTube ролик → 🔴 и статус «отклонён»", (row.status, row.reason))
-    check(tg.find("YouTube отклонил ролик — претензия правообладателя") is not None, "пришло 🔴 с причиной")
+    check(await eventually(lambda: tg.find("YouTube отклонил ролик — претензия правообладателя")), "пришло 🔴 с причиной")
 
     row = await wait_for(lambda: status_in(n_jc.id, finals), 300, "N.JC")
     check(row.status == Status.PUBLISHED, "ролик без предупреждений опубликован сам", (row.status, row.error, get_warnings(row)))
     pub = tg.find(f"✅ Опубликовано: «{n_jc.title[:30]}")
     check(pub is not None and tg.messages[pub]["silent"], "сообщение о публикации без звука")
+    await asyncio.sleep(2)
+    check(not google.playlists, "пока новая политика не принята, плейлисты не создаются", google.playlists)
+    await press(policy, "✅")
+    n_jc_video = (await seg(n_jc.id)).youtube_id
+    await wait_for(lambda: (google.playlist("Just Chatting")[1] or {}).get("items") == [n_jc_video], 30, "плейлист JC")
+    _, jc_list = google.playlist("Just Chatting")
+    check(jc_list["title"] == "Just Chatting | Заквиель" and jc_list["privacy"] == "public",
+          "после согласия опубликованный ролик попал в новый плейлист своей категории", jc_list)
 
     row = await wait_for(lambda: status_in(n_mc.id, finals), 600, "N.MC после перезапуска")
     check(row.status == Status.REVIEW and any("заблокирован в 2 странах" in w for w in get_warnings(row)),
@@ -694,7 +777,7 @@ async def main():
     mc_sessions = [v for v in google.sessions.values() if v["title"].startswith("Minecraft | ФРИКЛЕНД")]
     check(len(mc_sessions) == 1 and mc_sessions[0]["queries"] >= 3,
           f"после сбоев и перезапуска загрузка продолжена в той же сессии (сессий до перезапуска: {sessions_before})")
-    decision = tg.find(f"⚠️ «{n_mc.title[:30]}")
+    decision = await eventually(lambda: tg.find(f"⚠️ «{n_mc.title[:30]}"))
     check(decision is not None and not tg.messages[decision]["silent"], "запрос решения приходит со звуком")
     check(buttons(tg.messages[n_mc.tg_message_id]["markup"])[:2] == ["✅ Опубликовать", "🔒 Оставить приватным"],
           "под сегментом кнопки решения")
@@ -760,12 +843,16 @@ async def main():
           "короткие куски и сериал не загружаются, каждый со своей причиной", reasons)
     check([r.title for r in w_rows] == [
         "Minecraft | Майнкрафт Лайв в 20:00 | Заквиель",
-        "Minecraft | Майнкрафт: строим базу | Заквиель",
+        "Minecraft | Майнкрафт: строим базу | Часть 3 | Заквиель",
         "Just Chatting | Майнкрафт: строим базу | Заквиель",
         "Just Chatting | Смотрим Во все тяжкие | Заквиель",
-    ], "названия «Категория | Название стрима | Заквиель»; пропущенный кусок не считается частью",
+    ], "третий загружаемый ролик Minecraft — «Часть 3»; пропущенный кусок и Just Chatting без номера",
           [r.title for r in w_rows])
-    w_mc, w_jc = w_rows[1], w_rows[2]
+    w_mc0, w_mc, w_jc = w_rows[0], w_rows[1], w_rows[2]
+    await press(w_mc0.tg_message_id, "⬆️")
+    row = await seg(w_mc0.id)
+    check(row.status == Status.QUEUED and row.title == "Minecraft | Майнкрафт Лайв в 20:00 | Часть 4 | Заквиель",
+          "пропущенный кусок, загруженный по кнопке, получает следующий номер части", (row.status, row.title))
     answer = await press(w_jc.tg_message_id, "⬆️")
     row = await seg(w_jc.id)
     check(row.status == Status.QUEUED and not row.force_review and answer == "Загружу",
@@ -773,16 +860,27 @@ async def main():
     async with db() as s, s.begin():
         await s.execute(update(Segment).where(Segment.id == w_mc.id).values(end=w_mc.start + 60))
         await s.execute(update(Segment).where(Segment.id == w_jc.id).values(end=w_jc.start + 60))
+        await s.execute(update(Segment).where(Segment.id == w_mc0.id).values(end=w_mc0.start + 60))
     await say("/resume")
     row = await wait_for(lambda: status_in(w_mc.id, finals), 300, "W.MC")
     check(row.status == Status.LOCKED, "проект без аудита: YouTube не дал опубликовать → 🔒", (row.status, row.reason))
-    check(tg.find("🔒 «Minecraft | Майнкрафт: строим") is not None, "пришло объяснение про аудит")
+    check(await eventually(lambda: tg.find("🔒 «Minecraft | Майнкрафт: строим")), "пришло объяснение про аудит")
     row = await wait_for(lambda: status_in(w_jc.id, finals), 300, "W.JC")
     check(row.status == Status.PUBLISHED, "короткий кусок, загруженный по кнопке, опубликован сам", (row.status, get_warnings(row)))
     meta = next(v["meta"] for v in google.sessions.values() if v["title"] == row.title)
     check(meta["snippet"]["description"].startswith("Майнкрафт: строим базу"), "в описании название этого отрезка")
+    row = await wait_for(lambda: status_in(w_mc0.id, finals), 300, "W.MC0")
+    check(row.status == Status.PUBLISHED, "ролик «Часть 4» опубликован", (row.status, get_warnings(row)))
     async with db() as s:
         check(await s.get(Vod, VOD_OLD) is None, "VOD, закончившийся до начала слежения, так и не тронут")
+    video = {sid: (await seg(sid)).youtube_id for sid in (n_jc.id, n_mc.id, w_jc.id, w_mc0.id, w_mc.id)}
+    await wait_for(lambda: (google.playlist("Minecraft")[1] or {}).get("items") == [video[n_mc.id], video[w_mc0.id]]
+                   and (google.playlist("Just Chatting")[1] or {}).get("items") == [video[n_jc.id], video[w_jc.id]],
+                   30, "плейлисты")
+    check(sorted((p["title"], p["privacy"]) for p in google.playlists.values())
+          == [("Just Chatting | Заквиель", "public"), ("Minecraft | Заквиель", "public")],
+          "по плейлисту на категорию; опубликованные ролики идут по порядку, отклонённые и закрытые в них не попали",
+          google.playlists)
 
     print("\n== 10. Файлы на «YouTube»", flush=True)
     by_title = {v["title"]: v for v in google.sessions.values() if v.get("video")}
@@ -837,6 +935,8 @@ async def main():
     google.videos.pop((await seg(s_mc.id)).youtube_id)  # отклонённый ролик удалили в YouTube Studio
     google.videos[(await seg(w_mc.id)).youtube_id]["privacy"] = "public"  # а заблокированный открыли там вручную
     google.channel_title = "Канал после переименования"
+    jc_pid, _ = google.playlist("Just Chatting")
+    google.playlists.pop(jc_pid)  # владелец удалил плейлист в Studio
     await run_daily_check()
     row = await wait_for(lambda: status_in(s_mc.id, (Status.FORGOTTEN,)), 30, "сверка роликов")
     check(row.youtube_id is None and "больше нет на YouTube" in (row.reason or ""),
@@ -846,6 +946,12 @@ async def main():
     check(row.youtube_id, "ролик, открытый вручную в YouTube Studio, отмечен опубликованным")
     check(all([(await seg(i)).youtube_id for i in uploaded if i != s_mc.id]), "остальные ролики на месте")
     check((await streamer_row()).youtube_channel_title == "Канал после переименования", "название канала обновлено")
+    async with db() as s:
+        stored = sorted(row.category for row in (await s.scalars(select(Playlist))).all())
+    check(stored == ["minecraft"], "плейлист, удалённый на YouTube, забыт при сверке", stored)
+    await wait_for(lambda: (google.playlist("Minecraft")[1] or {}).get("items", [])[-1:] == [video[w_mc.id]], 30,
+                   "W.MC в плейлисте")
+    check(True, "ролик, открытый в Studio, тоже попал в плейлист своей категории")
 
     reply = await say("/disconnect")
     confirm = reply[-1][0]
@@ -868,6 +974,10 @@ async def main():
     check(not leftovers and all(r.status == Status.FORGOTTEN for r in rows),
           "ID роликов и сессий загрузки удалены", [(r.status, r.youtube_id) for r in rows])
     check(paused and paused.value == "1", "после отключения обработка на паузе")
+    async with db() as s:
+        left = (await s.scalars(select(Playlist))).all()
+        agreed = await s.get(KV, "consent_version")
+    check(not left and agreed is None, "ID плейлистов и согласие тоже удалены", (left, agreed))
     check(buttons(tg.messages[s_jc.tg_message_id]["markup"]) == ["▶️ Twitch"],
           "под роликом, ждавшим решения, остались только ссылки", buttons(tg.messages[s_jc.tg_message_id]["markup"]))
 

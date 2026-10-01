@@ -14,11 +14,12 @@ from .db import Segment, Status, Streamer, Vod, as_utc, get_spans, get_warnings
 from .segments import fmt_duration, fmt_spans, twitch_time_param
 
 PUBLISH, KEEP, RETRY, FORCE = "pub", "keep", "rt", "force"
-CONNECT, DISCONNECT, CANCEL = "on", "off", "cancel"
+CONNECT, ACCEPT, DISCONNECT, CANCEL = "on", "accept", "off", "cancel"
 
 YOUTUBE_TERMS_URL = "https://www.youtube.com/t/terms"
 GOOGLE_PRIVACY_URL = "https://www.google.com/policies/privacy"
 PRIVACY_NAMES = {"private": "приватным", "unlisted": "доступным только по ссылке", "public": "публичным"}
+PLAYLIST_PRIVACY = {"unlisted": "доступные по ссылке", "public": "публичные"}
 
 
 class SegmentAction(CallbackData, prefix="seg"):
@@ -46,9 +47,9 @@ def confirm_keyboard(text: str, action: str) -> InlineKeyboardMarkup:
     )
 
 
-def render_consent(settings: Settings, streamer_name: str) -> str:
-    """Что AutoVOD будет делать с каналом. Правила YouTube API требуют показать это
-    и получить согласие с политикой конфиденциальности до входа."""
+def render_consent(settings: Settings, streamer_name: str, update: bool = False) -> str:
+    """Что AutoVOD будет делать с каналом. Правила YouTube API требуют показать это и получить
+    согласие с политикой конфиденциальности до входа, а когда политика меняется — снова."""
     privacy = PRIVACY_NAMES[settings.publish_privacy]
     if settings.auto_publish:
         publishing = (
@@ -57,15 +58,30 @@ def render_consent(settings: Settings, streamer_name: str) -> str:
         )
     else:
         publishing = f"делать ролик {privacy} только по вашей кнопке «Опубликовать»"
+    if update:
+        header = (
+            "📄 <b>Политика конфиденциальности AutoVOD обновлена</b>\n"
+            "Теперь бот раскладывает опубликованные ролики по плейлистам категорий. Пока вы не примете "
+            "новую политику, плейлисты не создаются, остальное работает как раньше.\n\n"
+        )
+    else:
+        header = "<b>Подключение YouTube-канала</b>\n\n"
+    playlists = (
+        f"• создавать {PLAYLIST_PRIVACY[settings.publish_privacy]} плейлисты по категориям и добавлять в них "
+        "опубликованные ролики;\n"
+        if settings.playlists
+        else ""
+    )
     return (
-        "<b>Подключение YouTube-канала</b>\n\n"
+        f"{header}"
         "С доступом к каналу AutoVOD будет:\n"
         f"• загружать на него сегменты стримов {escape(streamer_name)} приватными роликами;\n"
         f"• {publishing};\n"
-        "• проверять состояние загруженных им роликов.\n\n"
-        "Другие ролики, комментарии, плейлисты и статистику канала AutoVOD не трогает. Он хранит зашифрованный "
-        "токен доступа, ID и название канала, ID и состояние своих роликов и раз в сутки сверяет их с YouTube. "
-        "Отключить канал и удалить эти данные — /disconnect.\n\n"
+        f"{playlists}"
+        "• проверять состояние загруженных им роликов и созданных плейлистов.\n\n"
+        "Другие ролики и плейлисты, комментарии и статистику канала AutoVOD не трогает. Он хранит "
+        "зашифрованный токен доступа, ID и название канала, ID и состояние своих роликов, ID своих плейлистов "
+        "и раз в сутки сверяет их с YouTube. Отключить канал и удалить эти данные — /disconnect.\n\n"
         f'Нажимая «Принимаю», вы соглашаетесь с <a href="{escape(settings.privacy_url)}">политикой '
         f'конфиденциальности</a> и <a href="{escape(settings.terms_url)}">условиями использования</a> AutoVOD '
         f'и с <a href="{YOUTUBE_TERMS_URL}">Условиями использования YouTube</a>. Как Google обращается с данными: '
@@ -152,7 +168,7 @@ def status_line(seg: Segment, tz: ZoneInfo, privacy: str) -> str:
 def render_segment(
     seg: Segment, vod: Vod, streamer: Streamer, tz: ZoneInfo, privacy: str
 ) -> tuple[str, InlineKeyboardMarkup | None]:
-    part = f" (часть {seg.part}{f'/{seg.parts}' if seg.parts else ''})" if seg.part else ""
+    part = f" (часть {seg.part})" if seg.part else ""
     date = local_time(vod.started_at, tz)
     name = escape(seg.stream_title or vod.title)
     stream = f"Стрим {date} «{name}»" if date else f"Стрим «{name}»"

@@ -5,6 +5,7 @@ from app.segments import (
     Chapter,
     PlannedSegment,
     build_description,
+    build_playlist_title,
     build_tags,
     build_title,
     category_warnings,
@@ -34,13 +35,8 @@ def spans(chapters):
     return [(c.start, c.end, c.title) for c in chapters]
 
 
-def parts(segments, no_part=()):
-    return [part for part, _ in number_parts(segments, no_part=no_part)]
-
-
-def plan(*chapters, no_part=(), **kwargs):
-    segments = plan_segments([Chapter(*c) for c in chapters], **kwargs)
-    return [(s.start, s.end, s.category, part) for s, part in zip(segments, parts(segments, no_part))]
+def plan(*chapters, **kwargs):
+    return [(s.start, s.end, s.category) for s in plan_segments([Chapter(*c) for c in chapters], **kwargs)]
 
 
 class NormalizeChaptersTest(unittest.TestCase):
@@ -83,49 +79,36 @@ class PlanSegmentsTest(unittest.TestCase):
     def test_each_category_change_is_a_segment(self):
         self.assertEqual(
             plan((0, 1800, "Just Chatting"), (1800, 9000, "Minecraft"), (9000, 12600, "Dota 2")),
-            [(0, 1800, "Just Chatting", None), (1800, 9000, "Minecraft", None), (9000, 12600, "Dota 2", None)],
+            [(0, 1800, "Just Chatting"), (1800, 9000, "Minecraft"), (9000, 12600, "Dota 2")],
         )
 
     def test_short_middle_segment_joins_previous(self):
         self.assertEqual(
             plan((0, 3600, "A"), (3600, 3660, "B"), (3660, 7200, "C")),
-            [(0, 3660, "A", None), (3660, 7200, "C", None)],
+            [(0, 3660, "A"), (3660, 7200, "C")],
         )
 
     def test_short_first_segment_joins_next(self):
-        self.assertEqual(plan((0, 60, "A"), (60, 3600, "B")), [(0, 3600, "B", None)])
+        self.assertEqual(plan((0, 60, "A"), (60, 3600, "B")), [(0, 3600, "B")])
 
     def test_short_last_segment_joins_previous(self):
-        self.assertEqual(plan((0, 3600, "A"), (3600, 3650, "B")), [(0, 3650, "A", None)])
+        self.assertEqual(plan((0, 3600, "A"), (3600, 3650, "B")), [(0, 3650, "A")])
 
     def test_misclick_between_same_game_joins_everything(self):
-        self.assertEqual(plan((0, 3600, "A"), (3600, 3630, "B"), (3630, 7200, "A")), [(0, 7200, "A", None)])
-
-    def test_repeated_category_gets_parts(self):
-        self.assertEqual(
-            plan((0, 3600, "A"), (3600, 7200, "B"), (7200, 10800, "A")),
-            [(0, 3600, "A", 1), (3600, 7200, "B", None), (7200, 10800, "A", 2)],
-        )
+        self.assertEqual(plan((0, 3600, "A"), (3600, 3630, "B"), (3630, 7200, "A")), [(0, 7200, "A")])
 
     def test_long_segment_is_split_into_equal_parts(self):
         result = plan((0, 13 * 3600, "A"))
-        self.assertEqual(result, [(0, 23400, "A", 1), (23400, 46800, "A", 2)])
-        self.assertTrue(all(end - start <= SPLIT_LIMIT_SEC for start, end, _, _ in result))
-
-    def test_long_segment_of_no_part_category_still_gets_numbers(self):
-        # иначе у двух роликов было бы одинаковое название
-        self.assertEqual(
-            plan((0, 13 * 3600, "Minecraft"), no_part=["Minecraft"]),
-            [(0, 23400, "Minecraft", 1), (23400, 46800, "Minecraft", 2)],
-        )
+        self.assertEqual(result, [(0, 23400, "A"), (23400, 46800, "A")])
+        self.assertTrue(all(end - start <= SPLIT_LIMIT_SEC for start, end, _ in result))
 
     def test_single_short_stream_is_kept(self):
-        self.assertEqual(plan((0, 60, "A")), [(0, 60, "A", None)])
+        self.assertEqual(plan((0, 60, "A")), [(0, 60, "A")])
 
     def test_min_length_is_configurable(self):
         self.assertEqual(
             plan((0, 3600, "A"), (3600, 3660, "B"), (3660, 7200, "C"), min_sec=30),
-            [(0, 3600, "A", None), (3600, 3660, "B", None), (3660, 7200, "C", None)],
+            [(0, 3600, "A"), (3600, 3660, "B"), (3660, 7200, "C")],
         )
 
 
@@ -137,16 +120,26 @@ class NumberPartsTest(unittest.TestCase):
         PlannedSegment(30, 40, "DOTA 2", "T3"),
     ]
 
-    def test_part_and_total_by_category(self):
-        self.assertEqual(number_parts(self.SEGMENTS), [(1, 3), (None, None), (2, 3), (3, 3)])
+    NO_PART = ["Just Chatting", "Minecraft"]
 
-    def test_skipped_segments_are_not_counted(self):
-        self.assertEqual(
-            number_parts(self.SEGMENTS, [True, True, False, True]), [(1, 2), (None, None), (None, None), (2, 2)]
-        )
+    def test_first_video_of_a_game_is_part_one(self):
+        self.assertEqual(number_parts(self.SEGMENTS[:2], no_part=self.NO_PART), [1, None])
 
-    def test_single_uploaded_part_has_no_number(self):
-        self.assertEqual(number_parts(self.SEGMENTS, [True, True, False, False]), [(None, None)] * 4)
+    def test_numbers_continue_across_streams_by_category(self):
+        # раньше уже было 4 ролика по Dota 2; регистр категории не важен
+        self.assertEqual(number_parts(self.SEGMENTS, no_part=self.NO_PART, counts={"dota 2": 4}), [5, None, 6, 7])
+
+    def test_skipped_segments_get_no_number_and_do_not_count(self):
+        self.assertEqual(number_parts(self.SEGMENTS, [True, True, False, True], self.NO_PART), [1, None, None, 2])
+
+    def test_no_part_categories_are_not_numbered(self):
+        segments = [PlannedSegment(0, 10, "Minecraft", "T1"), PlannedSegment(10, 20, "minecraft", "T2")]
+        self.assertEqual(number_parts(segments, no_part=self.NO_PART), [None, None])
+
+    def test_long_segment_of_no_part_category_is_numbered(self):
+        # иначе у двух роликов было бы одинаковое название
+        segments = plan_segments([Chapter(0, 13 * 3600, "Minecraft", "T")])
+        self.assertEqual(number_parts(segments, no_part=self.NO_PART), [1, 2])
 
 
 class TitleTest(unittest.TestCase):
@@ -155,28 +148,34 @@ class TitleTest(unittest.TestCase):
 
     def test_part(self):
         self.assertEqual(
-            build_title("Dota 2", "Турнир", "Заквиель", part=2, parts=3), "Dota 2 | Турнир | 2/3 | Заквиель"
+            build_title("Dota 2", "Турнир", "Заквиель", part=7), "Dota 2 | Турнир | Часть 7 | Заквиель"
         )
 
     def test_angle_brackets_and_spaces_removed(self):
         self.assertEqual(build_title("<Game>", "a  <b> c", "S"), "Game | a b c | S")
 
     def test_empty_stream_title(self):
-        self.assertEqual(build_title("Dota 2", "", "Заквиель", part=1, parts=2), "Dota 2 | 1/2 | Заквиель")
+        self.assertEqual(build_title("Dota 2", "", "Заквиель", part=1), "Dota 2 | Часть 1 | Заквиель")
 
     def test_long_title_is_shortened_keeping_category_part_and_streamer(self):
         long = "очень длинное название " * 10
-        title = build_title("Dota 2", long, "Заквиель", part=1, parts=2)
+        title = build_title("Dota 2", long, "Заквиель", part=12)
         self.assertLessEqual(len(title), 100)
         category, shortened, part, streamer = title.split(" | ")
-        self.assertEqual((category, part, streamer), ("Dota 2", "1/2", "Заквиель"))
+        self.assertEqual((category, part, streamer), ("Dota 2", "Часть 12", "Заквиель"))
         self.assertTrue(shortened.endswith("…"))
         self.assertTrue(long.startswith(shortened[:-1] + " "), shortened)  # обрезано по границе слова
 
     def test_extremely_long_category_still_fits(self):
-        title = build_title("x" * 150, "название", "Заквиель", part=1, parts=2)
+        title = build_title("x" * 150, "название", "Заквиель", part=1)
         self.assertLessEqual(len(title), 100)
-        self.assertTrue(title.endswith(" | 1/2 | Заквиель"))
+        self.assertTrue(title.endswith(" | Часть 1 | Заквиель"))
+
+    def test_playlist_title(self):
+        self.assertEqual(build_playlist_title("Dota 2", "Заквиель"), "Dota 2 | Заквиель")
+        title = build_playlist_title("x" * 200, "Заквиель")
+        self.assertLessEqual(len(title), 150)
+        self.assertTrue(title.endswith("… | Заквиель"))
 
 
 class DescriptionTest(unittest.TestCase):
@@ -283,9 +282,14 @@ class CategoryWarningsTest(unittest.TestCase):
 
 
 
-def titled(chapters, marks, no_part=(), **kwargs):
+def titled(chapters, marks, **kwargs):
     segments = plan_segments(split_by_titles([Chapter(*c) for c in chapters], marks), **kwargs)
-    return [(s.start, s.end, s.category, s.stream_title, part) for s, part in zip(segments, parts(segments, no_part))]
+    return [(s.start, s.end, s.category, s.stream_title) for s in segments]
+
+
+def numbered(chapters, marks, no_part=()):
+    segments = plan_segments(split_by_titles([Chapter(*c) for c in chapters], marks))
+    return number_parts(segments, no_part=no_part)
 
 
 class SplitByTitlesTest(unittest.TestCase):
@@ -314,44 +318,31 @@ class PlanWithTitlesTest(unittest.TestCase):
         self.assertEqual(
             titled([(0, 3600, "Minecraft"), (3600, 7200, "Just Chatting")], [(0, "Строим"), (1800, "Взрываем")]),
             [
-                (0, 1800, "Minecraft", "Строим", 1),
-                (1800, 3600, "Minecraft", "Взрываем", 2),
-                (3600, 7200, "Just Chatting", "Взрываем", None),
+                (0, 1800, "Minecraft", "Строим"),
+                (1800, 3600, "Minecraft", "Взрываем"),
+                (3600, 7200, "Just Chatting", "Взрываем"),
             ],
         )
 
     def test_quick_typo_fix_joins_previous(self):
         self.assertEqual(
             titled([(0, 3600, "A")], [(0, "Т1"), (1800, "Опечатка"), (1830, "Т2")]),
-            [(0, 1830, "A", "Т1", 1), (1830, 3600, "A", "Т2", 2)],
-        )
-
-    def test_same_category_and_title_parts_are_numbered(self):
-        chapters = [(0, 1800, "Dota 2"), (1800, 3600, "B"), (3600, 5400, "Dota 2")]
-        self.assertEqual(
-            [part for *_, part in titled(chapters, [(0, "T")])],
-            [1, None, 2],
+            [(0, 1830, "A", "Т1"), (1830, 3600, "A", "Т2")],
         )
 
     def test_no_part_categories(self):
         chapters = [(0, 3600, "Minecraft"), (3600, 7200, "Dota 2")]
         marks = [(0, "T1"), (1800, "T2"), (3600, "T3"), (5400, "T4")]
-        self.assertEqual(
-            [part for *_, part in titled(chapters, marks, no_part=["just chatting", "minecraft"])],
-            [None, None, 1, 2],
-        )
+        self.assertEqual(numbered(chapters, marks, no_part=["just chatting", "minecraft"]), [None, None, 1, 2])
 
     def test_parts_are_counted_by_category_across_titles(self):
         chapters = [(0, 1800, "A"), (1800, 3600, "B"), (3600, 5400, "A")]
+        marks = [(0, "T1"), (3000, "T2")]
         self.assertEqual(
-            titled(chapters, [(0, "T1"), (3000, "T2")]),
-            [
-                (0, 1800, "A", "T1", 1),
-                (1800, 3000, "B", "T1", 1),
-                (3000, 3600, "B", "T2", 2),
-                (3600, 5400, "A", "T2", 2),
-            ],
+            titled(chapters, marks),
+            [(0, 1800, "A", "T1"), (1800, 3000, "B", "T1"), (3000, 3600, "B", "T2"), (3600, 5400, "A", "T2")],
         )
+        self.assertEqual(numbered(chapters, marks), [1, 1, 2, 2])
 
 
 class ShortReasonTest(unittest.TestCase):
@@ -371,15 +362,14 @@ class SkipBySegmentTitleTest(unittest.TestCase):
         segments = titled(
             [(0, 3600, "Just Chatting"), (3600, 7200, "Minecraft"), (7200, 10800, "Just Chatting")],
             [(0, "ФРИКЛЕНД - строим"), (7200, "Смотрим Во все тяжкие")],
-            no_part=["Just Chatting", "Minecraft"],
         )
-        reasons = [skip(category, title) for _, _, category, title, _ in segments]
+        reasons = [skip(category, title) for _, _, category, title in segments]
         self.assertEqual([reason is None for reason in reasons], [True, True, False])
 
 
 def joined(*chapters, **kwargs):
     segments = plan_segments([Chapter(*c) for c in chapters], join=True, **kwargs)
-    return [(s.category, s.spans, s.duration, part) for s, part in zip(segments, parts(segments))]
+    return [(s.category, s.spans, s.duration) for s in segments]
 
 
 class JoinRepeatedTest(unittest.TestCase):
@@ -387,8 +377,8 @@ class JoinRepeatedTest(unittest.TestCase):
         self.assertEqual(
             joined((0, 2400, "Just Chatting"), (2400, 18000, "Minecraft"), (18000, 27000, "Just Chatting")),
             [
-                ("Just Chatting", [(0, 2400), (18000, 27000)], 11400, None),
-                ("Minecraft", [(2400, 18000)], 15600, None),
+                ("Just Chatting", [(0, 2400), (18000, 27000)], 11400),
+                ("Minecraft", [(2400, 18000)], 15600),
             ],
         )
 
@@ -413,16 +403,16 @@ class JoinRepeatedTest(unittest.TestCase):
     def test_misclick_is_still_absorbed_before_joining(self):
         self.assertEqual(
             joined((0, 3600, "A"), (3600, 3630, "B"), (3630, 7200, "C"), (7200, 9000, "B")),
-            [("A", [(0, 3630)], 3630, None), ("C", [(3630, 7200)], 3570, None), ("B", [(7200, 9000)], 1800, None)],
+            [("A", [(0, 3630)], 3630), ("C", [(3630, 7200)], 3570), ("B", [(7200, 9000)], 1800)],
         )
 
     def test_too_long_joined_video_is_split_across_fragments(self):
         hours = 3600
         result = joined((0, 8 * hours, "A"), (8 * hours, 9 * hours, "B"), (9 * hours, 17 * hours, "A"))
-        self.assertEqual(result[0][:3], ("A", [(0, 8 * hours)], 8 * hours))
-        self.assertEqual(result[1][:3], ("A", [(9 * hours, 17 * hours)], 8 * hours))
-        self.assertEqual((result[0][3], result[1][3]), (1, 2))
-        self.assertEqual(result[2][:3], ("B", [(8 * hours, 9 * hours)], hours))
+        self.assertEqual(
+            result,
+            [("A", [(0, 8 * hours)], 8 * hours), ("A", [(9 * hours, 17 * hours)], 8 * hours), ("B", [(8 * hours, 9 * hours)], hours)],
+        )
 
     def test_split_point_inside_second_fragment(self):
         hours = 3600
@@ -430,12 +420,12 @@ class JoinRepeatedTest(unittest.TestCase):
         # 12 часов одной категории — два ролика по 6 часов: 2 + 4 и ещё 6
         self.assertEqual(result[0][1], [(0, 2 * hours), (3 * hours, 7 * hours)])
         self.assertEqual(result[1][1], [(7 * hours, 13 * hours)])
-        self.assertTrue(all(duration <= SPLIT_LIMIT_SEC for _, _, duration, _ in result))
+        self.assertTrue(all(duration <= SPLIT_LIMIT_SEC for _, _, duration in result))
 
     def test_without_join_repeats_stay_separate(self):
         self.assertEqual(
             plan((0, 3600, "A"), (3600, 7200, "B"), (7200, 10800, "A")),
-            [(0, 3600, "A", 1), (3600, 7200, "B", None), (7200, 10800, "A", 2)],
+            [(0, 3600, "A"), (3600, 7200, "B"), (7200, 10800, "A")],
         )
 
     def test_fmt_spans(self):

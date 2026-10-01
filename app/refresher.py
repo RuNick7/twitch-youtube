@@ -1,4 +1,5 @@
 """Раз в сутки: действует ли доступ к YouTube и не устарели ли сохранённые данные.
+Между сверками — раскладка опубликованных роликов по плейлистам.
 
 Правила YouTube API требуют обновлять сохранённые данные не реже раза в 30 дней,
 а после отзыва доступа удалять их (в политике конфиденциальности обещано 7 дней).
@@ -15,6 +16,7 @@ from sqlalchemy import or_, select
 
 from .context import App
 from .db import Segment, Status, Streamer, Vod, as_utc, kv_get, kv_set, utcnow
+from .playlists import sync_playlists, verify_playlists
 from .service import DELETED_REASON, PUBLISHABLE, REVOKED_REASON, YOUTUBE_FIELDS, forget_youtube, set_status
 from .worker import set_paused
 from .youtube import AuthError, YouTubeError
@@ -35,12 +37,18 @@ class Refresher:
 
     async def run(self) -> None:
         while True:
+            self.app.sync_wake.clear()
             try:
                 if await self._due():
                     await self.refresh()
+                await sync_playlists(self.app)
             except Exception:
-                log.exception("Сбой ежедневной сверки с YouTube")
-            await asyncio.sleep(TICK_SEC)
+                log.exception("Сбой сверки с YouTube")
+            try:
+                # Публикация будит раньше: ролик сразу попадает в плейлист
+                await asyncio.wait_for(self.app.sync_wake.wait(), timeout=TICK_SEC)
+            except asyncio.TimeoutError:
+                pass
 
     async def _due(self) -> bool:
         async with self.app.sessions() as session:
@@ -77,6 +85,7 @@ class Refresher:
         try:
             channel_id, title = await app.youtube.my_channel(token)
             items = await app.youtube.videos(token, [youtube_id for _, youtube_id, _ in rows]) if rows else {}
+            await verify_playlists(app, streamer, token)
         except AuthError as exc:
             if exc.reason != "invalid_grant":
                 log.warning("Google не принял ключи приложения: %s", exc)
