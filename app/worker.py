@@ -135,10 +135,10 @@ class Worker:
         await app.refresh_segment(segment_id)
 
     async def _connected(self, streamer: Streamer) -> bool:
-        """Действует ли тот же доступ к YouTube, с которым началась загрузка."""
+        """Подключён ли ещё канал, на который шла загрузка. Повторный вход в тот же канал — не отключение."""
         async with self.app.sessions() as session:
             current = await session.get(Streamer, streamer.id)
-        return current.youtube_token == streamer.youtube_token
+        return current.youtube_token is not None and current.youtube_channel_id == streamer.youtube_channel_id
 
     async def _plan(self, seg: Segment, vod: Vod) -> Plan:
         if vod.playlist_url:
