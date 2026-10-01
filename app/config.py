@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     youtube_language: str = "ru"
     youtube_category_id: str = "20"  # Gaming
 
+    # Политика конфиденциальности и условия использования: бот показывает их перед подключением канала.
+    # Своя копия бота публикуется со своими страницами
+    privacy_url: str = "https://runick7.github.io/twitch-youtube/privacy.html"
+    terms_url: str = "https://runick7.github.io/twitch-youtube/terms.html"
+
     # Слежение за каналом: как часто проверять и сколько ждать после конца стрима
     watch_interval_sec: int = 300
     watch_grace_min: int = 10

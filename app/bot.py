@@ -8,15 +8,38 @@ from html import escape
 
 import httpx
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, Message
 
 from .context import App
 from .db import Segment, Status, Vod, find_streamer, get_streamer, utcnow
 from .segments import is_short_reason, parse_vod_id
-from .service import PUBLISHABLE, IngestError, ingest_vod, publish, set_status, status_counts
+from .service import (
+    DISCONNECTED_REASON,
+    PUBLISHABLE,
+    IngestError,
+    forget_youtube,
+    ingest_vod,
+    publish,
+    set_status,
+    status_counts,
+)
 from .tools import ToolError, fetch_vod_info
-from .ui import FORCE, KEEP, PUBLISH, RETRY, SegmentAction
+from .ui import (
+    CANCEL,
+    CONNECT,
+    DISCONNECT,
+    FORCE,
+    KEEP,
+    PUBLISH,
+    RETRY,
+    SegmentAction,
+    YouTubeAction,
+    confirm_keyboard,
+    render_consent,
+    render_disconnect,
+)
 from .worker import is_paused, set_paused
 from .youtube import AuthError, DeviceCode, YouTubeError
 
@@ -27,9 +50,11 @@ HELP = (
     "ролики без предупреждений публикуются, по остальным бот спросит.\n\n"
     "/process &lt;ссылка на VOD&gt; — обработать VOD вручную (старый или пропущенный)\n"
     "/youtube — подключить YouTube-канал\n"
+    "/disconnect — отключить YouTube-канал и удалить сохранённые о нём данные\n"
     "/status — состояние\n"
     "/pause, /resume — остановить и продолжить загрузку и публикацию"
 )
+PUBLISH_PLACES = {"public": "публично", "unlisted": "по ссылке"}
 
 STATUS_LABELS = (
     (Status.QUEUED, "в очереди"),
@@ -43,6 +68,7 @@ STATUS_LABELS = (
     (Status.REJECTED, "отклонены"),
     (Status.FAILED, "с ошибкой"),
     (Status.SKIPPED, "пропущены"),
+    (Status.FORGOTTEN, "данные удалены"),
 )
 
 
@@ -106,17 +132,32 @@ async def connect_youtube(message: Message, app: App) -> None:
     if not (app.settings.google_client_id and app.settings.google_client_secret):
         await message.answer("Сначала заполните GOOGLE_CLIENT_ID и GOOGLE_CLIENT_SECRET в .env и перезапустите контейнер.")
         return
+    async with app.sessions() as session:
+        streamer = await find_streamer(session, app.settings.twitch_channel)
+    name = (streamer.display_name if streamer else None) or app.settings.twitch_channel
+    # Вход только после согласия: так требуют правила YouTube API
+    await message.answer(
+        render_consent(app.settings, name), reply_markup=confirm_keyboard("✅ Принимаю, подключить", CONNECT)
+    )
+
+
+@owner.callback_query(YouTubeAction.filter(F.action == CONNECT))
+async def accept_and_connect(query: CallbackQuery, app: App) -> None:
+    await query.answer()
+    await _drop_buttons(query)
     try:
         code = await app.youtube.start_device_flow()
     except (YouTubeError, httpx.HTTPError) as exc:
-        await message.answer(f"🔴 Google не выдал код: {escape(str(exc))}")
+        await app.notify(f"🔴 Google не выдал код: {escape(str(exc))}")
         return
-    prompt = await message.answer(
+    prompt = await app.notify(
         f"Откройте {code.verification_url} и введите код <code>{code.user_code}</code>\n"
-        f"Код действует {code.expires_in // 60} мин. Войдите в Google-аккаунт, "
-        "которому принадлежит канал, и выберите нужный канал."
+        f"Код действует {code.expires_in // 60} мин. Войдите в Google-аккаунт, которому принадлежит канал, "
+        "выберите канал и разрешите управлять аккаунтом YouTube: без этого нельзя загружать ролики "
+        "и менять их доступ."
     )
-    app.spawn(_finish_youtube(app, code, prompt))
+    if prompt:
+        app.spawn(_finish_youtube(app, code, prompt))
 
 
 async def _finish_youtube(app: App, code: DeviceCode, prompt: Message) -> None:
@@ -131,7 +172,69 @@ async def _finish_youtube(app: App, code: DeviceCode, prompt: Message) -> None:
         streamer.youtube_token = app.vault.encrypt(refresh_token)
         streamer.youtube_channel_id = channel_id
         streamer.youtube_channel_title = title
-    await prompt.edit_text(f"✅ Подключён канал «{escape(title)}»")
+    paused = "\nОбработка на паузе: /resume — продолжить." if await is_paused(app) else ""
+    await prompt.edit_text(f"✅ Подключён канал «{escape(title)}»{paused}")
+
+
+@owner.message(Command("disconnect"))
+async def disconnect(message: Message, app: App) -> None:
+    async with app.sessions() as session:
+        streamer = await find_streamer(session, app.settings.twitch_channel)
+    if not (streamer and streamer.youtube_token):
+        await message.answer("YouTube-канал не подключён.")
+        return
+    await message.answer(
+        render_disconnect(streamer.youtube_channel_title or ""),
+        reply_markup=confirm_keyboard("🔌 Отключить и удалить данные", DISCONNECT),
+    )
+
+
+@owner.callback_query(YouTubeAction.filter(F.action == DISCONNECT))
+async def confirm_disconnect(query: CallbackQuery, app: App) -> None:
+    async with app.sessions() as session:
+        streamer = await find_streamer(session, app.settings.twitch_channel)
+    if not (streamer and streamer.youtube_token):
+        await query.answer("Канал уже отключён")
+        await _drop_buttons(query)
+        return
+    await query.answer("Отключаю…")
+    try:
+        await app.youtube.revoke(app.vault.decrypt(streamer.youtube_token))
+    except (YouTubeError, httpx.HTTPError) as exc:
+        await app.notify(
+            f"🔴 Google не отозвал доступ: {escape(str(exc))}. Данные не удалены, попробуйте ещё раз: /disconnect"
+        )
+        return
+    await set_paused(app, True)
+    await forget_youtube(app, streamer.id, DISCONNECTED_REASON)
+    text = (
+        f"✅ Канал «{escape(streamer.youtube_channel_title or '')}» отключён: доступ в Google отозван, "
+        "AutoVOD удалил токен, данные канала, ID и состояние роликов. Ролики на YouTube не тронуты.\n"
+        "Подключить снова — /youtube, затем /resume."
+    )
+    if isinstance(query.message, Message):
+        try:
+            await query.message.edit_text(text)
+            return
+        except TelegramBadRequest as exc:
+            log.info("Сообщение об отключении не обновлено: %s", exc)
+    await app.notify(text)
+
+
+@owner.callback_query(YouTubeAction.filter(F.action == CANCEL))
+async def cancel(query: CallbackQuery) -> None:
+    await query.answer("Отменено")
+    await _drop_buttons(query)
+
+
+async def _drop_buttons(query: CallbackQuery) -> None:
+    """Убирает кнопки подтверждения, чтобы их не нажали второй раз."""
+    if not (isinstance(query.message, Message) and query.message.reply_markup):
+        return
+    try:
+        await query.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest as exc:  # кнопки уже убраны или сообщение слишком старое
+        log.info("Кнопки не убраны: %s", exc)
 
 
 @owner.message(Command("status"))
@@ -147,6 +250,12 @@ async def show_status(message: Message, app: App) -> None:
     segments = ", ".join(f"{label} {counts[key]}" for key, label in STATUS_LABELS if counts.get(key))
     disk = shutil.disk_usage(app.settings.data_dir)
     paused = await is_paused(app)
+    settings = app.settings
+    publishing = (
+        f"{PUBLISH_PLACES[settings.publish_privacy]} через {settings.publish_delay_min} мин после обработки"
+        if settings.auto_publish
+        else "выключена"
+    )
     await message.answer(
         "\n".join(
             [
@@ -154,7 +263,7 @@ async def show_status(message: Message, app: App) -> None:
                 *([f"Название стрима сейчас: «{escape(app.live_title)}»"] if app.live_title else []),
                 f"YouTube: {youtube}",
                 f"Обработка: {'⏸ на паузе, /resume — продолжить' if paused else '▶️ работает'}",
-                f"Автопубликация: {'через ' + str(app.settings.publish_delay_min) + ' мин после обработки' if app.settings.auto_publish else 'выключена'}",
+                f"Автопубликация: {publishing}",
                 f"Сегменты: {segments or 'пока нет'}",
                 f"Диск: свободно {disk.free / 1024**3:.0f} из {disk.total / 1024**3:.0f} ГБ",
                 f"yt-dlp: {escape(app.ytdlp_version)}",

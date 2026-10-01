@@ -1,4 +1,4 @@
-"""YouTube Data API: вход по коду (device flow), загрузка потока с докачкой, состояние и публикация."""
+"""YouTube Data API: вход по коду (device flow) и отзыв доступа, загрузка потока с докачкой, состояние и публикация."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ log = logging.getLogger(__name__)
 
 DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
+REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 # youtube.upload в device flow недоступен, а youtube покрывает загрузку и изменение видео
 SCOPE = "https://www.googleapis.com/auth/youtube"
 UPLOAD_URL = "https://www.googleapis.com/upload/youtube/v3/videos"
@@ -172,16 +173,37 @@ class YouTubeClient:
         expires_at = time.monotonic() + int(data.get("expires_in", 3600))
         self._access[refresh_token] = (data["access_token"], expires_at)
 
+    def forget(self, refresh_token: str) -> None:
+        """Забывает токен доступа, выданный по этому refresh-токену."""
+        self._access.pop(refresh_token, None)
+
+    async def revoke(self, refresh_token: str) -> None:
+        """Отзывает доступ в Google. Уже недействительный токен — тоже успех."""
+        self.forget(refresh_token)
+        resp = await self._http.post(REVOKE_URL, data={"token": refresh_token})
+        if resp.status_code != 200:
+            error = _error(resp)
+            if error.reason not in ("invalid_token", "invalid_grant"):
+                raise error
+
     async def _auth(self, refresh_token: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {await self.access_token(refresh_token)}"}
 
+    async def _api(self, method: str, path: str, refresh_token: str, **kwargs) -> httpx.Response:
+        """Запрос к Data API.
+
+        Если токен доступа отозвали раньше срока (401), он запрашивается заново.
+        Когда отозван и сам доступ, это становится AuthError.
+        """
+        resp = await self._http.request(method, f"{API_URL}/{path}", headers=await self._auth(refresh_token), **kwargs)
+        if resp.status_code == 401:
+            self.forget(refresh_token)
+            resp = await self._http.request(method, f"{API_URL}/{path}", headers=await self._auth(refresh_token), **kwargs)
+        return resp
+
     async def my_channel(self, refresh_token: str) -> tuple[str, str]:
         """ID и название канала, к которому выдан доступ."""
-        resp = await self._http.get(
-            f"{API_URL}/channels",
-            params={"part": "snippet", "mine": "true"},
-            headers=await self._auth(refresh_token),
-        )
+        resp = await self._api("GET", "channels", refresh_token, params={"part": "snippet", "mine": "true"})
         if resp.status_code != 200:
             raise _error(resp)
         items = resp.json().get("items") or []
@@ -301,10 +323,11 @@ class YouTubeClient:
         """Состояние роликов по ID. Удалённых роликов в ответе нет. 1 единица квоты на 50 роликов."""
         result: dict[str, dict] = {}
         for i in range(0, len(ids), 50):
-            resp = await self._http.get(
-                f"{API_URL}/videos",
+            resp = await self._api(
+                "GET",
+                "videos",
+                refresh_token,
                 params={"part": "status,processingDetails,contentDetails", "id": ",".join(ids[i : i + 50])},
-                headers=await self._auth(refresh_token),
             )
             if resp.status_code != 200:
                 raise _error(resp)
@@ -320,11 +343,8 @@ class YouTubeClient:
         """
         status = {key: current[key] for key in ("embeddable", "license", "publicStatsViewable") if key in current}
         status.update(privacyStatus=privacy, selfDeclaredMadeForKids=False, containsSyntheticMedia=False)
-        resp = await self._http.put(
-            f"{API_URL}/videos",
-            params={"part": "status"},
-            json={"id": video_id, "status": status},
-            headers=await self._auth(refresh_token),
+        resp = await self._api(
+            "PUT", "videos", refresh_token, params={"part": "status"}, json={"id": video_id, "status": status}
         )
         if resp.status_code != 200:
             raise _error(resp)
