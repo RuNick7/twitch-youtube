@@ -15,6 +15,8 @@ h1 { font-size: 28px; line-height: 1.25; margin: 0 0 16px; }
 h2 { font-size: 20px; margin: 32px 0 8px; }
 a { color: var(--link); }
 .muted { color: var(--muted); }
+.badge { display: inline-block; margin-top: 4px; }
+.badge img { display: block; width: 210px; height: auto; }
 hr { border: 0; border-top: 1px solid var(--rule); margin: 48px 0; }
 </style>
 </head>
@@ -24,13 +26,20 @@ hr { border: 0; border-top: 1px solid var(--rule); margin: 48px 0; }
 
 <h1>AutoVOD</h1>
 <p>AutoVOD publishes segments of the Twitch broadcasts of <a href="https://www.twitch.tv/zakvielchannel">zakvielchannel</a> on YouTube, with the written permission of the streamer.</p>
-<p>After each broadcast AutoVOD splits the recording by category and uploads each part as a private video to a single YouTube channel operated by RuNick7. A video is made public after YouTube has processed and checked it. Parts in which films or TV series are watched are not uploaded.</p>
-<p>AutoVOD is a private tool and is not offered to the public. It uses YouTube API Services.</p>
+<p>After each broadcast AutoVOD splits the recording by game and stream title and uploads each part as a private video. A video is made public after YouTube has processed it and reports no problems; otherwise the operator decides in a private Telegram bot. Parts in which films or TV series are watched are not uploaded.</p>
+<p>AutoVOD is a private tool operated by RuNick7 and is not offered to the public. It uses YouTube API Services.</p>
+
+<h2>Where the videos appear</h2>
+<p>All videos are published on a single YouTube channel operated by RuNick7: <a href="https://www.youtube.com/channel/UCRYjZb_kmKKKKwPOacIDojQ">Заквиель Архив Стримов | Нарезки</a>.</p>
+<a class="badge" href="https://www.youtube.com/channel/UCRYjZb_kmKKKKwPOacIDojQ"><picture><source srcset="developed-with-youtube-light.png" media="(prefers-color-scheme: dark)"><img src="developed-with-youtube-dark.png" width="700" height="250" alt="Developed with YouTube"></picture></a>
+
+<h2>Privacy</h2>
+<p>Before AutoVOD gets access to a YouTube channel, it shows what it will do and asks the channel owner to accept the <a href="privacy.html">Privacy Policy</a>. Access can be revoked at any time with the <code>/disconnect</code> command in the bot or on the <a href="https://security.google.com/settings/security/permissions">Google security settings page</a>.</p>
 <ul>
 <li><a href="privacy.html">Privacy Policy</a></li>
 <li><a href="terms.html">Terms of Service</a></li>
 <li><a href="https://www.youtube.com/t/terms">YouTube Terms of Service</a></li>
-<li><a href="https://policies.google.com/privacy">Google Privacy Policy</a></li>
+<li><a href="https://www.google.com/policies/privacy">Google Privacy Policy</a></li>
 <li><a href="https://github.com/RuNick7/twitch-youtube">Source code</a></li>
 </ul>
 <p>Contact: <a href="https://github.com/RuNick7/twitch-youtube/issues">GitHub Issues</a></p>
@@ -40,13 +49,20 @@ hr { border: 0; border-top: 1px solid var(--rule); margin: 48px 0; }
 <section id="ru" lang="ru">
 <h1>AutoVOD</h1>
 <p>AutoVOD публикует на YouTube фрагменты трансляций Twitch-канала <a href="https://www.twitch.tv/zakvielchannel">zakvielchannel</a> с письменного разрешения стримера.</p>
-<p>После каждой трансляции AutoVOD делит запись по категориям и загружает каждую часть приватным роликом на один YouTube-канал, которым управляет RuNick7. Ролик становится публичным после того, как YouTube его обработал и проверил. Части, где смотрят фильмы или сериалы, не загружаются.</p>
-<p>AutoVOD — частный инструмент, он не предлагается другим пользователям. Он использует сервисы YouTube API (YouTube API Services).</p>
+<p>После каждой трансляции AutoVOD делит запись по играм и названиям стрима и загружает каждую часть приватным роликом. Ролик становится публичным после того, как YouTube его обработал и не нашёл проблем; иначе решение принимает оператор в закрытом Telegram-боте. Части, где смотрят фильмы или сериалы, не загружаются.</p>
+<p>AutoVOD — частный инструмент, которым управляет RuNick7; другим пользователям он не предлагается. Он использует сервисы YouTube API (YouTube API Services).</p>
+
+<h2>Где выходят ролики</h2>
+<p>Все ролики публикуются на одном YouTube-канале, которым управляет RuNick7: <a href="https://www.youtube.com/channel/UCRYjZb_kmKKKKwPOacIDojQ">Заквиель Архив Стримов | Нарезки</a>.</p>
+<a class="badge" href="https://www.youtube.com/channel/UCRYjZb_kmKKKKwPOacIDojQ"><picture><source srcset="developed-with-youtube-light.png" media="(prefers-color-scheme: dark)"><img src="developed-with-youtube-dark.png" width="700" height="250" alt="Developed with YouTube"></picture></a>
+
+<h2>Конфиденциальность</h2>
+<p>Прежде чем получить доступ к YouTube-каналу, AutoVOD показывает, что он будет делать, и просит владельца канала принять <a href="privacy.html#ru">Политику конфиденциальности</a>. Отозвать доступ можно в любой момент командой <code>/disconnect</code> в боте или на <a href="https://security.google.com/settings/security/permissions">странице настроек безопасности Google</a>.</p>
 <ul>
 <li><a href="privacy.html#ru">Политика конфиденциальности</a></li>
 <li><a href="terms.html#ru">Условия использования</a></li>
 <li><a href="https://www.youtube.com/t/terms">Условия использования YouTube</a></li>
-<li><a href="https://policies.google.com/privacy">Политика конфиденциальности Google</a></li>
+<li><a href="https://www.google.com/policies/privacy">Политика конфиденциальности Google</a></li>
 <li><a href="https://github.com/RuNick7/twitch-youtube">Исходный код</a></li>
 </ul>
 <p>Связь: <a href="https://github.com/RuNick7/twitch-youtube/issues">GitHub Issues</a></p>

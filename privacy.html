@@ -24,37 +24,57 @@ hr { border: 0; border-top: 1px solid var(--rule); margin: 48px 0; }
 <h1>AutoVOD Privacy Policy</h1>
 <p class="muted">Last updated: October 1, 2026</p>
 
-<p>AutoVOD is a private tool operated by RuNick7. It publishes segments of the Twitch broadcasts of <a href="https://www.twitch.tv/zakvielchannel">zakvielchannel</a> on a single YouTube channel operated by RuNick7, with the written permission of the streamer. AutoVOD is not offered to the public.</p>
+<p>AutoVOD is a private tool operated by RuNick7. It publishes segments of the Twitch broadcasts of <a href="https://www.twitch.tv/zakvielchannel">zakvielchannel</a> on a single YouTube channel operated by RuNick7, with the written permission of the streamer. AutoVOD is not offered to the public. The operator controls it through a private Telegram bot.</p>
 
 <h2>YouTube API Services</h2>
-<p>AutoVOD uses YouTube API Services. By using AutoVOD you agree to the <a href="https://www.youtube.com/t/terms">YouTube Terms of Service</a>. How Google handles data is described in the <a href="https://policies.google.com/privacy">Google Privacy Policy</a>.</p>
+<p>AutoVOD uses YouTube API Services. By using AutoVOD you agree to be bound by the <a href="https://www.youtube.com/t/terms">YouTube Terms of Service</a>. How Google handles data is described in the Google Privacy Policy: <a href="http://www.google.com/policies/privacy">http://www.google.com/policies/privacy</a>.</p>
+
+<h2>Consent</h2>
+<p>Before AutoVOD gets access to a YouTube channel, the bot shows what AutoVOD will do with the channel and asks the channel owner to accept this Privacy Policy. Access is granted only after that, through Google sign-in (OAuth 2.0).</p>
 
 <h2>Information AutoVOD accesses</h2>
-<p>When the owner of the YouTube channel authorizes AutoVOD with their Google account, AutoVOD receives access with the scope <code>https://www.googleapis.com/auth/youtube</code> and uses it only to:</p>
+<p>AutoVOD requests the scope <code>https://www.googleapis.com/auth/youtube</code> and uses it only to:</p>
 <ul>
 <li>read the ID and title of the authorized channel;</li>
-<li>upload videos to that channel and set their title, description, tags, category and privacy status;</li>
-<li>read the processing status, privacy status, duration and restrictions of the videos AutoVOD uploaded, and make those videos public.</li>
+<li>upload videos to that channel as private and set their title, description, tags and category;</li>
+<li>read the processing status, privacy status, duration and restrictions of the videos AutoVOD uploaded;</li>
+<li>make those videos public (or unlisted, as configured by the owner): automatically after YouTube has processed a video and reported no problems, or when the owner presses a button in the bot.</li>
 </ul>
-<p>AutoVOD does not access viewers' data, comments, subscribers, analytics, playlists or any other videos of the channel.</p>
+<p>AutoVOD does not access viewers' data, comments, subscribers, analytics, playlists or any other videos of the channel, and never asks for Google or YouTube passwords.</p>
 
 <h2>Information AutoVOD stores</h2>
 <ul>
 <li>the OAuth refresh token, encrypted;</li>
 <li>the ID and title of the authorized channel;</li>
-<li>the IDs and statuses of the videos AutoVOD uploaded.</li>
+<li>the IDs and statuses of the videos AutoVOD uploaded;</li>
+<li>the Telegram user ID of the operator, which is the only account the bot accepts commands from, and the IDs of the bot's own messages, so that it can update them. Messages from other Telegram users are ignored; their Telegram ID may appear in server logs, which are overwritten automatically.</li>
 </ul>
-<p>This information is stored on a server controlled by the operator and is used only to upload and publish videos to the authorized channel. Video files pass through the server while being uploaded and are not stored.</p>
+<p>This information is stored on a server controlled by the operator. Video files pass through the server while being uploaded and are not stored.</p>
 
-<h2>Sharing</h2>
-<p>AutoVOD does not sell, share or transfer any of this information to third parties, and does not use it for advertising.</p>
+<h2>How the information is used and shared</h2>
+<p>The information is used only to upload and publish videos on the authorized channel and to report progress to the operator. Progress messages, which include video titles and links, are delivered to the operator through Telegram (<a href="https://telegram.org/privacy">Telegram Privacy Policy</a>).</p>
+<p>AutoVOD does not sell, share or transfer this information to any other party, does not use it for advertising, and does not allow third parties to serve content or advertisements.</p>
+
+<h2>Cookies and device data</h2>
+<p>AutoVOD does not store, access or collect information on or from users' devices or browsers, and does not place or read cookies or similar technologies. This website does not use cookies either. It is hosted on GitHub Pages, and GitHub may log visitors' IP addresses for security purposes (<a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement">GitHub Privacy Statement</a>).</p>
+
+<h2>Keeping data up to date</h2>
+<p>Every day AutoVOD checks that its access to the channel is still valid and refreshes the stored channel title and video statuses from YouTube. Records of videos that were deleted from YouTube are removed. Stored YouTube data is never kept for more than 30 days without being refreshed.</p>
 
 <h2>Revoking access and deleting data</h2>
-<p>You can revoke AutoVOD's access to your data at any time on the Google security settings page: <a href="https://security.google.com/settings/security/permissions">https://security.google.com/settings/security/permissions</a>.</p>
-<p>After access is revoked, or on request, all stored information about your account is deleted within 7 days.</p>
+<p>The <code>/disconnect</code> command in the bot immediately revokes AutoVOD's access token at Google and deletes all stored information about the channel and its videos.</p>
+<p>You can also revoke AutoVOD's access at any time on the Google security settings page: <a href="https://security.google.com/settings/security/permissions">https://security.google.com/settings/security/permissions</a>. AutoVOD then deletes all stored information about the channel within 7 days (in practice at its next daily check).</p>
+<p>A request to delete the stored data can also be sent through <a href="https://github.com/RuNick7/twitch-youtube/issues">GitHub Issues</a>; it is fulfilled within 7 days.</p>
+<p>Deleting the data stored by AutoVOD does not delete anything on YouTube: the uploaded videos stay on the channel. To delete them, use YouTube Studio.</p>
+
+<h2>Security</h2>
+<p>The refresh token is stored encrypted. Only the operator has access to the server and to the bot.</p>
+
+<h2>Changes to this policy</h2>
+<p>If AutoVOD starts to access or use data in a way that this policy does not describe, the policy will be updated first, and the channel owner will be asked to accept it again.</p>
 
 <h2>Contact</h2>
-<p>Questions about this policy: <a href="https://github.com/RuNick7/twitch-youtube/issues">GitHub Issues</a>.</p>
+<p>Questions or complaints about this policy and AutoVOD's privacy practices: <a href="https://github.com/RuNick7/twitch-youtube/issues">GitHub Issues</a>.</p>
 
 <hr>
 
@@ -62,37 +82,57 @@ hr { border: 0; border-top: 1px solid var(--rule); margin: 48px 0; }
 <h1>Политика конфиденциальности AutoVOD</h1>
 <p class="muted">Последнее обновление: 1 октября 2026 года</p>
 
-<p>AutoVOD — частный инструмент, которым управляет RuNick7. Он публикует фрагменты трансляций Twitch-канала <a href="https://www.twitch.tv/zakvielchannel">zakvielchannel</a> на одном YouTube-канале, которым управляет RuNick7, с письменного разрешения стримера. AutoVOD не предлагается другим пользователям.</p>
+<p>AutoVOD — частный инструмент, которым управляет RuNick7. Он публикует фрагменты трансляций Twitch-канала <a href="https://www.twitch.tv/zakvielchannel">zakvielchannel</a> на одном YouTube-канале, которым управляет RuNick7, с письменного разрешения стримера. AutoVOD не предлагается другим пользователям. Оператор управляет им через закрытый Telegram-бот.</p>
 
 <h2>Сервисы YouTube API</h2>
-<p>AutoVOD использует сервисы YouTube API (YouTube API Services). Пользуясь AutoVOD, вы соглашаетесь с <a href="https://www.youtube.com/t/terms">Условиями использования YouTube</a>. Как Google обращается с данными, описано в <a href="https://policies.google.com/privacy">Политике конфиденциальности Google</a>.</p>
+<p>AutoVOD использует сервисы YouTube API (YouTube API Services). Пользуясь AutoVOD, вы соглашаетесь соблюдать <a href="https://www.youtube.com/t/terms">Условия использования YouTube</a>. Как Google обращается с данными, описано в Политике конфиденциальности Google: <a href="http://www.google.com/policies/privacy">http://www.google.com/policies/privacy</a>.</p>
+
+<h2>Согласие</h2>
+<p>Прежде чем AutoVOD получит доступ к YouTube-каналу, бот показывает, что AutoVOD будет делать с каналом, и просит владельца канала принять эту Политику конфиденциальности. Только после этого доступ выдаётся через вход в аккаунт Google (OAuth 2.0).</p>
 
 <h2>К каким данным AutoVOD получает доступ</h2>
-<p>Когда владелец YouTube-канала разрешает AutoVOD доступ через свой аккаунт Google, AutoVOD получает доступ с областью <code>https://www.googleapis.com/auth/youtube</code> и использует его только чтобы:</p>
+<p>AutoVOD запрашивает область <code>https://www.googleapis.com/auth/youtube</code> и использует её только чтобы:</p>
 <ul>
 <li>узнать ID и название подключённого канала;</li>
-<li>загружать ролики на этот канал и задавать им название, описание, теги, категорию и доступ;</li>
-<li>узнавать состояние обработки, доступ, длительность и ограничения роликов, загруженных AutoVOD, и делать эти ролики публичными.</li>
+<li>загружать на этот канал приватные ролики и задавать им название, описание, теги и категорию;</li>
+<li>узнавать состояние обработки, доступ, длительность и ограничения роликов, загруженных AutoVOD;</li>
+<li>делать эти ролики публичными (или доступными по ссылке, как настроил владелец): автоматически, когда YouTube обработал ролик и не нашёл проблем, или по кнопке владельца в боте.</li>
 </ul>
-<p>AutoVOD не получает данных зрителей, комментариев, подписчиков, статистики, плейлистов и других роликов канала.</p>
+<p>AutoVOD не получает данных зрителей, комментариев, подписчиков, статистики, плейлистов и других роликов канала и никогда не запрашивает пароли от Google или YouTube.</p>
 
 <h2>Какие данные AutoVOD хранит</h2>
 <ul>
 <li>токен обновления OAuth в зашифрованном виде;</li>
 <li>ID и название подключённого канала;</li>
-<li>ID и состояние роликов, загруженных AutoVOD.</li>
+<li>ID и состояние роликов, загруженных AutoVOD;</li>
+<li>Telegram ID оператора — единственного аккаунта, от которого бот принимает команды, — и ID собственных сообщений бота, чтобы их обновлять. Сообщения других пользователей Telegram бот игнорирует; их Telegram ID может попасть в журналы сервера, которые автоматически перезаписываются.</li>
 </ul>
-<p>Эти данные хранятся на сервере, которым управляет оператор, и используются только для загрузки и публикации роликов на подключённом канале. Видеофайлы проходят через сервер во время загрузки и не сохраняются.</p>
+<p>Эти данные хранятся на сервере, которым управляет оператор. Видеофайлы проходят через сервер во время загрузки и не сохраняются.</p>
 
-<h2>Передача данных</h2>
-<p>AutoVOD не продаёт и не передаёт эти данные третьим лицам и не использует их для рекламы.</p>
+<h2>Как данные используются и кому передаются</h2>
+<p>Данные используются только для загрузки и публикации роликов на подключённом канале и для отчётов оператору. Сообщения о ходе работы с названиями роликов и ссылками доставляются оператору через Telegram (<a href="https://telegram.org/privacy">Политика конфиденциальности Telegram</a>).</p>
+<p>AutoVOD не продаёт и не передаёт эти данные другим лицам, не использует их для рекламы и не позволяет третьим лицам показывать контент или рекламу.</p>
+
+<h2>Cookie и данные устройств</h2>
+<p>AutoVOD не хранит, не получает и не собирает информацию на устройствах или в браузерах пользователей и не использует cookie и похожие технологии. Этот сайт тоже не использует cookie. Он размещён на GitHub Pages, и GitHub может записывать IP-адреса посетителей в целях безопасности (<a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement">заявление GitHub о конфиденциальности</a>).</p>
+
+<h2>Актуальность данных</h2>
+<p>Каждый день AutoVOD проверяет, что доступ к каналу ещё действует, и обновляет сохранённые название канала и состояние роликов по данным YouTube. Записи о роликах, удалённых с YouTube, стираются. Данные YouTube никогда не хранятся дольше 30 дней без обновления.</p>
 
 <h2>Отзыв доступа и удаление данных</h2>
-<p>Отозвать доступ AutoVOD к вашим данным можно в любой момент на странице настроек безопасности Google: <a href="https://security.google.com/settings/security/permissions">https://security.google.com/settings/security/permissions</a>.</p>
-<p>После отзыва доступа или по запросу все сохранённые данные о вашем аккаунте удаляются в течение 7 дней.</p>
+<p>Команда <code>/disconnect</code> в боте сразу отзывает токен доступа AutoVOD в Google и удаляет все сохранённые данные о канале и его роликах.</p>
+<p>Отозвать доступ AutoVOD можно и в любой момент на странице настроек безопасности Google: <a href="https://security.google.com/settings/security/permissions">https://security.google.com/settings/security/permissions</a>. Тогда AutoVOD удаляет все сохранённые данные о канале в течение 7 дней (на деле — при ближайшей ежедневной проверке).</p>
+<p>Запрос на удаление сохранённых данных можно также отправить через <a href="https://github.com/RuNick7/twitch-youtube/issues">GitHub Issues</a>; он выполняется в течение 7 дней.</p>
+<p>Удаление данных, которые хранит AutoVOD, ничего не удаляет на YouTube: загруженные ролики остаются на канале. Удалить их можно в YouTube Studio.</p>
+
+<h2>Безопасность</h2>
+<p>Токен обновления хранится в зашифрованном виде. Доступ к серверу и боту есть только у оператора.</p>
+
+<h2>Изменения политики</h2>
+<p>Если AutoVOD начнёт получать или использовать данные так, как эта политика не описывает, сначала будет обновлена политика, и владельца канала попросят принять её заново.</p>
 
 <h2>Связь</h2>
-<p>Вопросы об этой политике: <a href="https://github.com/RuNick7/twitch-youtube/issues">GitHub Issues</a>.</p>
+<p>Вопросы и жалобы об этой политике и обращении AutoVOD с данными: <a href="https://github.com/RuNick7/twitch-youtube/issues">GitHub Issues</a>.</p>
 </section>
 </main>
 </body>
