@@ -3,6 +3,7 @@ import unittest
 from app.segments import (
     SPLIT_LIMIT_SEC,
     Chapter,
+    PlannedSegment,
     build_description,
     build_tags,
     build_title,
@@ -12,6 +13,7 @@ from app.segments import (
     fmt_spans,
     is_short_reason,
     normalize_chapters,
+    number_parts,
     parse_vod_id,
     plan_segments,
     short_reason,
@@ -32,8 +34,13 @@ def spans(chapters):
     return [(c.start, c.end, c.title) for c in chapters]
 
 
-def plan(*chapters, **kwargs):
-    return [(s.start, s.end, s.category, s.part) for s in plan_segments([Chapter(*c) for c in chapters], **kwargs)]
+def parts(segments, no_part=()):
+    return [part for part, _ in number_parts(segments, no_part=no_part)]
+
+
+def plan(*chapters, no_part=(), **kwargs):
+    segments = plan_segments([Chapter(*c) for c in chapters], **kwargs)
+    return [(s.start, s.end, s.category, part) for s, part in zip(segments, parts(segments, no_part))]
 
 
 class NormalizeChaptersTest(unittest.TestCase):
@@ -105,6 +112,13 @@ class PlanSegmentsTest(unittest.TestCase):
         self.assertEqual(result, [(0, 23400, "A", 1), (23400, 46800, "A", 2)])
         self.assertTrue(all(end - start <= SPLIT_LIMIT_SEC for start, end, _, _ in result))
 
+    def test_long_segment_of_no_part_category_still_gets_numbers(self):
+        # иначе у двух роликов было бы одинаковое название
+        self.assertEqual(
+            plan((0, 13 * 3600, "Minecraft"), no_part=["Minecraft"]),
+            [(0, 23400, "Minecraft", 1), (23400, 46800, "Minecraft", 2)],
+        )
+
     def test_single_short_stream_is_kept(self):
         self.assertEqual(plan((0, 60, "A")), [(0, 60, "A", None)])
 
@@ -115,30 +129,54 @@ class PlanSegmentsTest(unittest.TestCase):
         )
 
 
+class NumberPartsTest(unittest.TestCase):
+    SEGMENTS = [
+        PlannedSegment(0, 10, "Dota 2", "T1"),
+        PlannedSegment(10, 20, "Just Chatting", "T1"),
+        PlannedSegment(20, 30, "Dota 2", "T2"),
+        PlannedSegment(30, 40, "DOTA 2", "T3"),
+    ]
+
+    def test_part_and_total_by_category(self):
+        self.assertEqual(number_parts(self.SEGMENTS), [(1, 3), (None, None), (2, 3), (3, 3)])
+
+    def test_skipped_segments_are_not_counted(self):
+        self.assertEqual(
+            number_parts(self.SEGMENTS, [True, True, False, True]), [(1, 2), (None, None), (None, None), (2, 2)]
+        )
+
+    def test_single_uploaded_part_has_no_number(self):
+        self.assertEqual(number_parts(self.SEGMENTS, [True, True, False, False]), [(None, None)] * 4)
+
+
 class TitleTest(unittest.TestCase):
     def test_basic(self):
-        self.assertEqual(build_title("Minecraft", "Строим замок", "Стример"), "Minecraft — Строим замок | Стример")
+        self.assertEqual(build_title("Minecraft", "Строим замок", "Заквиель"), "Minecraft | Строим замок | Заквиель")
 
     def test_part(self):
         self.assertEqual(
-            build_title("Minecraft", "Строим замок", "Стример", part=2),
-            "Minecraft (часть 2) — Строим замок | Стример",
+            build_title("Dota 2", "Турнир", "Заквиель", part=2, parts=3), "Dota 2 | Турнир | 2/3 | Заквиель"
         )
 
     def test_angle_brackets_and_spaces_removed(self):
-        self.assertEqual(build_title("<Game>", "a  <b> c", "S"), "Game — a b c | S")
+        self.assertEqual(build_title("<Game>", "a  <b> c", "S"), "Game | a b c | S")
 
     def test_empty_stream_title(self):
-        self.assertEqual(build_title("Minecraft", "", "Стример"), "Minecraft | Стример")
+        self.assertEqual(build_title("Dota 2", "", "Заквиель", part=1, parts=2), "Dota 2 | 1/2 | Заквиель")
 
-    def test_long_title_is_shortened_keeping_game_and_streamer(self):
-        title = build_title("Minecraft", "очень длинное название " * 10, "Стример")
+    def test_long_title_is_shortened_keeping_category_part_and_streamer(self):
+        long = "очень длинное название " * 10
+        title = build_title("Dota 2", long, "Заквиель", part=1, parts=2)
         self.assertLessEqual(len(title), 100)
-        self.assertTrue(title.startswith("Minecraft — очень"))
-        self.assertTrue(title.endswith("… | Стример"))
+        category, shortened, part, streamer = title.split(" | ")
+        self.assertEqual((category, part, streamer), ("Dota 2", "1/2", "Заквиель"))
+        self.assertTrue(shortened.endswith("…"))
+        self.assertTrue(long.startswith(shortened[:-1] + " "), shortened)  # обрезано по границе слова
 
     def test_extremely_long_category_still_fits(self):
-        self.assertLessEqual(len(build_title("x" * 150, "название", "Стример")), 100)
+        title = build_title("x" * 150, "название", "Заквиель", part=1, parts=2)
+        self.assertLessEqual(len(title), 100)
+        self.assertTrue(title.endswith(" | 1/2 | Заквиель"))
 
 
 class DescriptionTest(unittest.TestCase):
@@ -245,9 +283,9 @@ class CategoryWarningsTest(unittest.TestCase):
 
 
 
-def titled(chapters, marks, **kwargs):
+def titled(chapters, marks, no_part=(), **kwargs):
     segments = plan_segments(split_by_titles([Chapter(*c) for c in chapters], marks), **kwargs)
-    return [(s.start, s.end, s.category, s.stream_title, s.part) for s in segments]
+    return [(s.start, s.end, s.category, s.stream_title, part) for s, part in zip(segments, parts(segments, no_part))]
 
 
 class SplitByTitlesTest(unittest.TestCase):
@@ -276,8 +314,8 @@ class PlanWithTitlesTest(unittest.TestCase):
         self.assertEqual(
             titled([(0, 3600, "Minecraft"), (3600, 7200, "Just Chatting")], [(0, "Строим"), (1800, "Взрываем")]),
             [
-                (0, 1800, "Minecraft", "Строим", None),
-                (1800, 3600, "Minecraft", "Взрываем", None),
+                (0, 1800, "Minecraft", "Строим", 1),
+                (1800, 3600, "Minecraft", "Взрываем", 2),
                 (3600, 7200, "Just Chatting", "Взрываем", None),
             ],
         )
@@ -285,7 +323,7 @@ class PlanWithTitlesTest(unittest.TestCase):
     def test_quick_typo_fix_joins_previous(self):
         self.assertEqual(
             titled([(0, 3600, "A")], [(0, "Т1"), (1800, "Опечатка"), (1830, "Т2")]),
-            [(0, 1830, "A", "Т1", None), (1830, 3600, "A", "Т2", None)],
+            [(0, 1830, "A", "Т1", 1), (1830, 3600, "A", "Т2", 2)],
         )
 
     def test_same_category_and_title_parts_are_numbered(self):
@@ -296,21 +334,22 @@ class PlanWithTitlesTest(unittest.TestCase):
         )
 
     def test_no_part_categories(self):
-        chapters = [(0, 1800, "Just Chatting"), (1800, 3600, "Minecraft"), (3600, 5400, "Just Chatting")]
+        chapters = [(0, 3600, "Minecraft"), (3600, 7200, "Dota 2")]
+        marks = [(0, "T1"), (1800, "T2"), (3600, "T3"), (5400, "T4")]
         self.assertEqual(
-            [part for *_, part in titled(chapters, [(0, "T")], no_part=["just chatting", "Minecraft"])],
-            [None, None, None],
+            [part for *_, part in titled(chapters, marks, no_part=["just chatting", "minecraft"])],
+            [None, None, 1, 2],
         )
 
-    def test_different_titles_are_not_parts_of_each_other(self):
+    def test_parts_are_counted_by_category_across_titles(self):
         chapters = [(0, 1800, "A"), (1800, 3600, "B"), (3600, 5400, "A")]
         self.assertEqual(
             titled(chapters, [(0, "T1"), (3000, "T2")]),
             [
-                (0, 1800, "A", "T1", None),
-                (1800, 3000, "B", "T1", None),
-                (3000, 3600, "B", "T2", None),
-                (3600, 5400, "A", "T2", None),
+                (0, 1800, "A", "T1", 1),
+                (1800, 3000, "B", "T1", 1),
+                (3000, 3600, "B", "T2", 2),
+                (3600, 5400, "A", "T2", 2),
             ],
         )
 
@@ -340,7 +379,7 @@ class SkipBySegmentTitleTest(unittest.TestCase):
 
 def joined(*chapters, **kwargs):
     segments = plan_segments([Chapter(*c) for c in chapters], join=True, **kwargs)
-    return [(s.category, s.spans, s.duration, s.part) for s in segments]
+    return [(s.category, s.spans, s.duration, part) for s, part in zip(segments, parts(segments))]
 
 
 class JoinRepeatedTest(unittest.TestCase):

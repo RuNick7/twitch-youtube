@@ -152,7 +152,7 @@ def status_line(seg: Segment, tz: ZoneInfo, privacy: str) -> str:
 def render_segment(
     seg: Segment, vod: Vod, streamer: Streamer, tz: ZoneInfo, privacy: str
 ) -> tuple[str, InlineKeyboardMarkup | None]:
-    part = f" (часть {seg.part})" if seg.part else ""
+    part = f" (часть {seg.part}{f'/{seg.parts}' if seg.parts else ''})" if seg.part else ""
     date = local_time(vod.started_at, tz)
     name = escape(seg.stream_title or vod.title)
     stream = f"Стрим {date} «{name}»" if date else f"Стрим «{name}»"

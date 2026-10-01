@@ -72,6 +72,7 @@ class Segment(Base):
     end: Mapped[int]
     category: Mapped[str] = mapped_column(String(256))
     part: Mapped[int | None]
+    parts: Mapped[int | None]  # сколько частей у этой категории в стриме: «1/3»
     title: Mapped[str] = mapped_column(String(256))
     stream_title: Mapped[str | None] = mapped_column(Text)  # название стрима на этом отрезке
     ranges: Mapped[str | None] = mapped_column(Text)  # JSON [[start, end], …], если ролик склеен из отрезков

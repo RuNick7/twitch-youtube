@@ -19,6 +19,9 @@ class Settings(BaseSettings):
 
     # Логин стримера: twitch.tv/<логин>
     twitch_channel: str
+    # Имя стримера в конце названия ролика — так, как его ищут зрители (например, «Заквиель»).
+    # Пусто — имя канала на Twitch
+    streamer_name: str = ""
 
     # OAuth-клиент Google типа «TVs and Limited Input devices»
     google_client_id: str = ""

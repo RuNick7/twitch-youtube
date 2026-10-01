@@ -27,6 +27,7 @@ from .segments import (
     build_title,
     category_warnings,
     normalize_chapters,
+    number_parts,
     plan_segments,
     short_reason,
     skip_reason,
@@ -82,12 +83,20 @@ async def ingest_vod(app: App, info: VodInfo) -> int:
         raise IngestError(f"VOD с канала {info.uploader_login}, а в настройках указан {settings.twitch_channel}")
 
     chapters = split_by_titles(normalize_chapters(info.chapters, info.duration), await title_marks(app, info))
-    planned = plan_segments(
-        chapters,
-        min_sec=settings.min_segment_sec,
-        no_part=settings.unnumbered_categories,
-        join=settings.join_repeated,
-    )
+    planned = plan_segments(chapters, min_sec=settings.min_segment_sec, join=settings.join_repeated)
+    stream_titles = [p.stream_title or info.title for p in planned]
+    reasons = [
+        skip_reason(
+            p.category,
+            stream_title,
+            keywords=settings.keywords,
+            title_categories=settings.title_categories,
+            categories=settings.skipped_categories,
+        )
+        or short_reason(p.duration, settings.skip_shorter_min)
+        for p, stream_title in zip(planned, stream_titles)
+    ]
+    numbers = number_parts(planned, [reason is None for reason in reasons], settings.unnumbered_categories)
     now = utcnow()
 
     async with app.sessions() as session, session.begin():
@@ -109,16 +118,10 @@ async def ingest_vod(app: App, info: VodInfo) -> int:
         # сегменты раньше VOD — тогда SQLite отвергнет их по внешнему ключу
         session.add(vod)
         await session.flush()
+        # В конце названия — имя, по которому стримера ищут зрители, а не название его канала
+        title_name = settings.streamer_name or name
         segments = []
-        for i, p in enumerate(planned, 1):
-            stream_title = p.stream_title or info.title
-            reason = skip_reason(
-                p.category,
-                stream_title,
-                keywords=settings.keywords,
-                title_categories=settings.title_categories,
-                categories=settings.skipped_categories,
-            ) or short_reason(p.duration, settings.skip_shorter_min)
+        for i, (p, stream_title, reason, (part, parts)) in enumerate(zip(planned, stream_titles, reasons, numbers), 1):
             segments.append(
                 Segment(
                     vod_id=info.id,
@@ -126,8 +129,9 @@ async def ingest_vod(app: App, info: VodInfo) -> int:
                     start=p.start,
                     end=p.end,
                     category=p.category,
-                    part=p.part,
-                    title=build_title(p.category, stream_title, name, p.part),
+                    part=part,
+                    parts=parts,
+                    title=build_title(p.category, stream_title, title_name, part, parts),
                     stream_title=stream_title,
                     ranges=dump_spans(p.spans),
                     status=Status.SKIPPED if reason else Status.QUEUED,
@@ -255,7 +259,7 @@ def build_metadata(app: App, seg: Segment, vod: Vod, streamer: Streamer) -> dict
             seg.category,
             get_spans(seg),
         ),
-        "tags": build_tags(seg.category, name, streamer.login, "стрим", "twitch"),
+        "tags": build_tags(seg.category, settings.streamer_name, name, streamer.login, "стрим", "twitch"),
         "categoryId": settings.youtube_category_id,
     }
     if settings.youtube_language:

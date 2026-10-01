@@ -49,6 +49,9 @@ os.environ.update(
     MONITOR_DAYS="1",
     TITLE_POLL_SEC="1",
     SKIP_SHORTER_MIN="4",
+    STREAMER_NAME="Заквиель",
+    # Minecraft нумеруется: в шаге 9 его короткий кусок пропущен и не должен превратить единственную часть в «2/2»
+    NO_PART_CATEGORIES="Just Chatting",
 )
 
 import app.__main__ as entry  # noqa: E402
@@ -651,11 +654,11 @@ async def main():
             await s.execute(update(Segment).where(Segment.id == sid).values(start=a, end=b))
         # склеенный ролик: по 30 секунд из начала стрима и из пятого часа
         await s.execute(update(Segment).where(Segment.id == s_jc.id).values(start=100, end=18030, ranges="[[100, 130], [18000, 18030]]"))
-    google.behaviours = {"Minecraft — ВО ВСЕ": "rejected", "Just Chatting — ФРИКЛЕНД": "monitor_block",
-                         "Minecraft — ФРИКЛЕНД": "blocked", "Just Chatting — ВО ВСЕ": "clean",
-                         "Minecraft — Майнкрафт: строим": "locked", "Just Chatting — Майнкрафт: строим": "clean"}
-    google.fail_plans = {"Minecraft — ФРИКЛЕНД": {1: "503", 3: "drop_half"}}
-    google.crash = {"Minecraft — ФРИКЛЕНД": 5}
+    google.behaviours = {"Minecraft | ВО ВСЕ": "rejected", "Just Chatting | ФРИКЛЕНД": "monitor_block",
+                         "Minecraft | ФРИКЛЕНД": "blocked", "Just Chatting | ВО ВСЕ": "clean",
+                         "Minecraft | Майнкрафт: строим": "locked", "Just Chatting | Майнкрафт: строим": "clean"}
+    google.fail_plans = {"Minecraft | ФРИКЛЕНД": {1: "503", 3: "drop_half"}}
+    google.crash = {"Minecraft | ФРИКЛЕНД": 5}
 
     print("\n== 4. «Всё равно загрузить» для пропущенного", flush=True)
     answer = await press(s_jc.tg_message_id, "⬆️")
@@ -667,7 +670,7 @@ async def main():
     await asyncio.wait_for(google.crash_event.wait(), 600)
     await crash(task)
     row = await seg(n_mc.id)
-    sid_mc = next(k for k, v in google.sessions.items() if v["title"].startswith("Minecraft — ФРИКЛЕНД"))
+    sid_mc = next(k for k, v in google.sessions.items() if v["title"].startswith("Minecraft | ФРИКЛЕНД"))
     got = google.sessions[sid_mc]["received"]
     check(row.status == Status.UPLOADING and row.upload_uri and row.upload_total,
           f"«падение» посреди загрузки: принято {got / 1e6:.0f} из {row.upload_total / 1e6:.0f} МБ, сессия сохранена")
@@ -688,7 +691,7 @@ async def main():
     row = await wait_for(lambda: status_in(n_mc.id, finals), 600, "N.MC после перезапуска")
     check(row.status == Status.REVIEW and any("заблокирован в 2 странах" in w for w in get_warnings(row)),
           "блокировка в странах → ролик ждёт решения", (row.status, get_warnings(row), row.error))
-    mc_sessions = [v for v in google.sessions.values() if v["title"].startswith("Minecraft — ФРИКЛЕНД")]
+    mc_sessions = [v for v in google.sessions.values() if v["title"].startswith("Minecraft | ФРИКЛЕНД")]
     check(len(mc_sessions) == 1 and mc_sessions[0]["queries"] >= 3,
           f"после сбоев и перезапуска загрузка продолжена в той же сессии (сессий до перезапуска: {sessions_before})")
     decision = tg.find(f"⚠️ «{n_mc.title[:30]}")
@@ -756,11 +759,12 @@ async def main():
     check(reasons[0] == reasons[2] == "короче 4 мин" and "во все тяжкие" in reasons[3],
           "короткие куски и сериал не загружаются, каждый со своей причиной", reasons)
     check([r.title for r in w_rows] == [
-        "Minecraft — Майнкрафт Лайв в 20:00 | ZakvielChannel",
-        "Minecraft — Майнкрафт: строим базу | ZakvielChannel",
-        "Just Chatting — Майнкрафт: строим базу | ZakvielChannel",
-        "Just Chatting — Смотрим Во все тяжкие | ZakvielChannel",
-    ], "у каждого ролика название его отрезка, без «часть N»", [r.title for r in w_rows])
+        "Minecraft | Майнкрафт Лайв в 20:00 | Заквиель",
+        "Minecraft | Майнкрафт: строим базу | Заквиель",
+        "Just Chatting | Майнкрафт: строим базу | Заквиель",
+        "Just Chatting | Смотрим Во все тяжкие | Заквиель",
+    ], "названия «Категория | Название стрима | Заквиель»; пропущенный кусок не считается частью",
+          [r.title for r in w_rows])
     w_mc, w_jc = w_rows[1], w_rows[2]
     answer = await press(w_jc.tg_message_id, "⬆️")
     row = await seg(w_jc.id)
@@ -772,7 +776,7 @@ async def main():
     await say("/resume")
     row = await wait_for(lambda: status_in(w_mc.id, finals), 300, "W.MC")
     check(row.status == Status.LOCKED, "проект без аудита: YouTube не дал опубликовать → 🔒", (row.status, row.reason))
-    check(tg.find("🔒 «Minecraft — Майнкрафт: строим") is not None, "пришло объяснение про аудит")
+    check(tg.find("🔒 «Minecraft | Майнкрафт: строим") is not None, "пришло объяснение про аудит")
     row = await wait_for(lambda: status_in(w_jc.id, finals), 300, "W.JC")
     check(row.status == Status.PUBLISHED, "короткий кусок, загруженный по кнопке, опубликован сам", (row.status, get_warnings(row)))
     meta = next(v["meta"] for v in google.sessions.values() if v["title"] == row.title)
