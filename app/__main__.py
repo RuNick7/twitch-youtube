@@ -1,4 +1,4 @@
-"""Точка входа: бот, очередь обработки и ежедневное обновление yt-dlp в одном процессе."""
+"""Точка входа: бот, слежение за каналом, очередь загрузки, проверка роликов и обновление yt-dlp в одном процессе."""
 
 from __future__ import annotations
 
@@ -13,11 +13,13 @@ from aiogram.enums import ParseMode
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from .bot import router
+from .checker import Checker
 from .config import Settings
 from .context import App
 from .crypto import Vault
 from .db import get_streamer, init_db, make_engine
 from .tools import update_ytdlp, ytdlp_version
+from .watcher import Watcher
 from .worker import Worker
 from .youtube import YouTubeClient
 
@@ -27,7 +29,7 @@ YTDLP_UPDATE_INTERVAL = 24 * 3600
 
 
 async def keep_ytdlp_fresh(app: App) -> None:
-    """Twitch периодически ломает скачивание, а исправления приходят со свежими версиями yt-dlp."""
+    """Twitch периодически ломает yt-dlp, а исправления приходят со свежими версиями."""
     while True:
         await asyncio.sleep(YTDLP_UPDATE_INTERVAL)
         await update_ytdlp()
@@ -39,7 +41,7 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     settings = Settings()
-    settings.work_dir.mkdir(parents=True, exist_ok=True)
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
 
     engine = make_engine(settings.db_path)
     await init_db(engine)
@@ -56,6 +58,7 @@ async def main() -> None:
             settings=settings,
             sessions=sessions,
             bot=bot,
+            http=http,
             youtube=YouTubeClient(settings.google_client_id, settings.google_client_secret, http),
             vault=Vault(settings.secret_key),
             tz=ZoneInfo(settings.tz),
@@ -68,6 +71,11 @@ async def main() -> None:
         dispatcher.include_router(router)
 
         app.spawn(Worker(app).run())
+        app.spawn(Checker(app).run())
+        if settings.watch_interval_sec > 0:
+            app.spawn(Watcher(app).run())
+        else:
+            app.watch_state = "слежение выключено (WATCH_INTERVAL_SEC=0), только /process"
         app.spawn(keep_ytdlp_fresh(app))
         if app.owner_id is None:
             log.warning("TELEGRAM_OWNER_ID не задан: напишите боту /start, чтобы узнать свой ID")

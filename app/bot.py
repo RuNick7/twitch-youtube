@@ -12,30 +12,37 @@ from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, Message
 
 from .context import App
-from .db import Status, Vod, find_streamer, get_streamer
+from .db import Segment, Status, Vod, find_streamer, get_streamer, utcnow
 from .segments import parse_vod_id
-from .service import IngestError, ingest_vod, set_status, status_counts
+from .service import PUBLISHABLE, IngestError, ingest_vod, publish, set_status, status_counts
 from .tools import ToolError, fetch_vod_info
-from .ui import APPROVE, REJECT, REJECT_NO, REJECT_YES, RETRY, SegmentAction, confirm_reject_keyboard
+from .ui import FORCE, KEEP, PUBLISH, RETRY, SegmentAction
 from .worker import is_paused, set_paused
-from .youtube import DeviceCode, YouTubeError
+from .youtube import AuthError, DeviceCode, YouTubeError
 
 log = logging.getLogger(__name__)
 
 HELP = (
-    "/process &lt;ссылка на VOD&gt; — нарезать VOD и прислать сегменты на проверку\n"
+    "Бот сам следит за каналом. После конца стрима сегменты загружаются на YouTube приватно, "
+    "ролики без предупреждений публикуются, по остальным бот спросит.\n\n"
+    "/process &lt;ссылка на VOD&gt; — обработать VOD вручную (старый или пропущенный)\n"
     "/youtube — подключить YouTube-канал\n"
-    "/status — состояние обработки\n"
-    "/pause, /resume — остановить и продолжить обработку"
+    "/status — состояние\n"
+    "/pause, /resume — остановить и продолжить загрузку и публикацию"
 )
 
 STATUS_LABELS = (
-    (Status.PENDING, "ждут проверки"),
-    (Status.APPROVED, "в очереди"),
-    (Status.DOWNLOADING, "скачиваются"),
+    (Status.QUEUED, "в очереди"),
     (Status.UPLOADING, "загружаются"),
-    (Status.UPLOADED, "загружены"),
+    (Status.PROCESSING, "обрабатываются"),
+    (Status.WAITING, "ждут проверки"),
+    (Status.REVIEW, "ждут решения"),
+    (Status.PUBLISHED, "опубликованы"),
+    (Status.PRIVATE, "оставлены приватными"),
+    (Status.LOCKED, "заблокированы YouTube"),
+    (Status.REJECTED, "отклонены"),
     (Status.FAILED, "с ошибкой"),
+    (Status.SKIPPED, "пропущены"),
 )
 
 
@@ -87,6 +94,10 @@ async def process(message: Message, command: CommandObject, app: App) -> None:
     except (ToolError, IngestError) as exc:
         await progress.edit_text(f"🔴 Не получилось: {escape(str(exc))}")
         return
+    except Exception as exc:
+        log.exception("VOD %s не обработан", vod_id)
+        await progress.edit_text(f"🔴 Внутренняя ошибка: {escape(str(exc)[:300])}")
+        return
     await progress.delete()
 
 
@@ -133,15 +144,17 @@ async def show_status(message: Message, app: App) -> None:
         if streamer and streamer.youtube_token
         else "не подключён, выполните /youtube"
     )
-    disk = shutil.disk_usage(app.settings.work_dir)
+    segments = ", ".join(f"{label} {counts[key]}" for key, label in STATUS_LABELS if counts.get(key))
+    disk = shutil.disk_usage(app.settings.data_dir)
     paused = await is_paused(app)
     await message.answer(
         "\n".join(
             [
-                f"Twitch: {escape(app.settings.twitch_channel)}",
+                f"Twitch: {escape(app.settings.twitch_channel)} — {app.watch_state}",
                 f"YouTube: {youtube}",
                 f"Обработка: {'⏸ на паузе, /resume — продолжить' if paused else '▶️ работает'}",
-                "Сегменты: " + ", ".join(f"{label} {counts.get(key, 0)}" for key, label in STATUS_LABELS),
+                f"Автопубликация: {'через ' + str(app.settings.publish_delay_min) + ' мин после обработки' if app.settings.auto_publish else 'выключена'}",
+                f"Сегменты: {segments or 'пока нет'}",
                 f"Диск: свободно {disk.free / 1024**3:.0f} из {disk.total / 1024**3:.0f} ГБ",
                 f"yt-dlp: {escape(app.ytdlp_version)}",
             ]
@@ -152,7 +165,9 @@ async def show_status(message: Message, app: App) -> None:
 @owner.message(Command("pause"))
 async def pause(message: Message, app: App) -> None:
     await set_paused(app, True)
-    await message.answer("⏸ Обработка остановлена: текущий сегмент доделается, следующие ждут /resume.")
+    await message.answer(
+        "⏸ Загрузка и автопубликация остановлены: текущий сегмент догрузится, остальное ждёт /resume."
+    )
 
 
 @owner.message(Command("resume"))
@@ -161,39 +176,47 @@ async def resume(message: Message, app: App) -> None:
     await message.answer("▶️ Обработка продолжена.")
 
 
-@owner.callback_query(SegmentAction.filter(F.action == APPROVE))
-async def approve(query: CallbackQuery, callback_data: SegmentAction, app: App) -> None:
-    changed = await set_status(app, callback_data.id, (Status.PENDING,), Status.APPROVED)
-    await query.answer("Одобрено" if changed else "Уже обработан")
-    await app.refresh_segment(callback_data.id)
-    if changed:
-        app.wake.set()
+@owner.callback_query(SegmentAction.filter(F.action == PUBLISH))
+async def publish_now(query: CallbackQuery, callback_data: SegmentAction, app: App) -> None:
+    async with app.sessions() as session:
+        seg = await session.get(Segment, callback_data.id)
+    if seg is None or seg.status not in PUBLISHABLE:
+        await query.answer("Уже обработан")
+        await app.refresh_segment(callback_data.id)
+        return
+    await query.answer("Публикую…")
+    try:
+        result = await publish(app, seg.id)
+    except AuthError:
+        result = "нет доступа к YouTube: выполните /youtube"
+    except (YouTubeError, httpx.HTTPError) as exc:
+        result = f"YouTube ответил ошибкой: {exc}"
+    if result not in ("Опубликовано", "YouTube не дал опубликовать"):
+        await app.notify(f"🔴 Не опубликовано: {escape(result)}", reply_to=seg.tg_message_id)
 
 
-@owner.callback_query(SegmentAction.filter(F.action == REJECT))
-async def ask_reject(query: CallbackQuery, callback_data: SegmentAction) -> None:
-    await query.answer()
-    if isinstance(query.message, Message):
-        await query.message.edit_reply_markup(reply_markup=confirm_reject_keyboard(callback_data.id))
-
-
-@owner.callback_query(SegmentAction.filter(F.action == REJECT_YES))
-async def reject(query: CallbackQuery, callback_data: SegmentAction, app: App) -> None:
-    changed = await set_status(app, callback_data.id, (Status.PENDING,), Status.REJECTED)
-    await query.answer("Отклонено" if changed else "Уже обработан")
-    await app.refresh_segment(callback_data.id)
-
-
-@owner.callback_query(SegmentAction.filter(F.action == REJECT_NO))
-async def cancel_reject(query: CallbackQuery, callback_data: SegmentAction, app: App) -> None:
-    await query.answer()
+@owner.callback_query(SegmentAction.filter(F.action == KEEP))
+async def keep_private(query: CallbackQuery, callback_data: SegmentAction, app: App) -> None:
+    changed = await set_status(app, callback_data.id, (Status.WAITING, Status.REVIEW), Status.PRIVATE, check_at=None)
+    await query.answer("Оставлен приватным" if changed else "Уже обработан")
     await app.refresh_segment(callback_data.id)
 
 
 @owner.callback_query(SegmentAction.filter(F.action == RETRY))
 async def retry(query: CallbackQuery, callback_data: SegmentAction, app: App) -> None:
-    changed = await set_status(app, callback_data.id, (Status.FAILED,), Status.APPROVED)
+    changed = await set_status(app, callback_data.id, (Status.FAILED,), Status.QUEUED, queued_at=utcnow(), error=None)
     await query.answer("Повторяю" if changed else "Уже обработан")
+    await app.refresh_segment(callback_data.id)
+    if changed:
+        app.wake.set()
+
+
+@owner.callback_query(SegmentAction.filter(F.action == FORCE))
+async def force_upload(query: CallbackQuery, callback_data: SegmentAction, app: App) -> None:
+    changed = await set_status(
+        app, callback_data.id, (Status.SKIPPED,), Status.QUEUED, queued_at=utcnow(), force_review=True
+    )
+    await query.answer("Загружу, но публиковать только после вашего решения" if changed else "Уже обработан")
     await app.refresh_segment(callback_data.id)
     if changed:
         app.wake.set()

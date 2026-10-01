@@ -6,13 +6,22 @@ from app.segments import (
     build_description,
     build_tags,
     build_title,
+    category_warnings,
     fmt_duration,
     fmt_hms,
     normalize_chapters,
     parse_vod_id,
     plan_segments,
+    skip_reason,
+    split_list,
     twitch_time_param,
 )
+
+KEYWORDS = split_list("во все тяжкие,звоните солу,сериал,серия,фильм,кино")
+
+
+def skip(category, title, categories=("Watch Party",)):
+    return skip_reason(category, title, keywords=KEYWORDS, title_categories=["Just Chatting"], categories=categories)
 
 
 def spans(chapters):
@@ -184,6 +193,46 @@ class ParseVodIdTest(unittest.TestCase):
         self.assertIsNone(parse_vod_id("https://www.twitch.tv/somechannel"))
         self.assertIsNone(parse_vod_id(""))
         self.assertIsNone(parse_vod_id(None))
+
+
+class SplitListTest(unittest.TestCase):
+    def test_split(self):
+        self.assertEqual(split_list(" a, b,,c , "), ["a", "b", "c"])
+        self.assertEqual(split_list(""), [])
+        self.assertEqual(split_list(None), [])
+
+
+class SkipReasonTest(unittest.TestCase):
+    def test_series_in_title_skips_just_chatting(self):
+        reason = skip("Just Chatting", "ФРИКЛЕНД - ДАЛЬНОБОЙНАЯ ПУШКА +Во все тяжкие")
+        self.assertIn("во все тяжкие", reason)
+
+    def test_game_segment_of_same_stream_is_kept(self):
+        self.assertIsNone(skip("Minecraft", "ФРИКЛЕНД - ДАЛЬНОБОЙНАЯ ПУШКА +Во все тяжкие"))
+
+    def test_just_chatting_without_keywords_is_kept(self):
+        self.assertIsNone(skip("Just Chatting", "ГЕНИАЛЬНЫЙ ПОДРУБ!"))
+
+    def test_case_and_yo_are_ignored(self):
+        self.assertIsNotNone(skip("just chatting", "ФЛ +Лучше ЗВОНИТЕ СОЛУ"))
+        self.assertIsNotNone(skip("Just Chatting", "Во всё тяжкие 5 сезон"))
+        self.assertIsNotNone(skip("Just Chatting", "ВО ВСЕ ТЯЖКИЕ 5 сезон, 6 серия (смотрит впервые)"))
+
+    def test_category_always_skipped(self):
+        self.assertIn("Watch Party", skip("Watch Party", "просто стрим"))
+
+    def test_empty_lists_skip_nothing(self):
+        self.assertIsNone(
+            skip_reason("Just Chatting", "Во все тяжкие", keywords=[], title_categories=[], categories=[])
+        )
+
+
+class CategoryWarningsTest(unittest.TestCase):
+    def test_risky_category(self):
+        self.assertEqual(len(category_warnings("slots", ["Slots", "Virtual Casino"])), 1)
+
+    def test_regular_category(self):
+        self.assertEqual(category_warnings("Minecraft", ["Slots"]), [])
 
 
 if __name__ == "__main__":

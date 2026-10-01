@@ -1,4 +1,4 @@
-"""YouTube Data API: вход по коду (device flow) и загрузка с докачкой."""
+"""YouTube Data API: вход по коду (device flow), загрузка потока с докачкой, состояние и публикация."""
 
 from __future__ import annotations
 
@@ -6,8 +6,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Awaitable, Callable
+from typing import AsyncGenerator, Awaitable, Callable
 
 import httpx
 
@@ -29,6 +28,7 @@ LIMIT_REASONS = {"uploadLimitExceeded", "quotaExceeded", "dailyLimitExceeded", "
 
 ProgressCallback = Callable[[int], Awaitable[None]]
 SessionCallback = Callable[[str], Awaitable[None]]
+StreamFactory = Callable[[int], AsyncGenerator[bytes, None]]
 
 
 class YouTubeError(RuntimeError):
@@ -69,6 +69,17 @@ def _error(resp: httpx.Response) -> YouTubeError:
             reason = err
             message = body.get("error_description") or err
     return YouTubeError(f"HTTP {resp.status_code}: {message}", reason, resp.status_code)
+
+
+async def _body(buffer: bytearray, size: int, step: int = 1 << 20) -> AsyncGenerator[bytes, None]:
+    """Тело куска порциями по 1 МБ: целиком кусок (32 МБ) в памяти не копируется.
+
+    С явным Content-Length httpx отправляет такое тело без chunked-кодирования.
+    """
+    for start in range(0, size, step):
+        with memoryview(buffer) as view:
+            piece = bytes(view[start : min(size, start + step)])
+        yield piece
 
 
 def _received_bytes(resp: httpx.Response) -> int:
@@ -180,10 +191,11 @@ class YouTubeClient:
 
     # --- загрузка ---
 
-    async def upload(
+    async def upload_stream(
         self,
         refresh_token: str,
-        path: Path,
+        total: int,
+        open_stream: StreamFactory,
         metadata: dict,
         *,
         session_uri: str | None,
@@ -192,12 +204,12 @@ class YouTubeClient:
         chunk_size: int,
         limit_mbit: int = 0,
     ) -> str:
-        """Загружает файл по протоколу resumable upload и возвращает ID видео.
+        """Загружает поток по протоколу resumable upload и возвращает ID видео.
 
-        Если передан session_uri прерванной загрузки, продолжает с последнего
-        принятого байта.
+        open_stream(offset) должен каждый раз отдавать одни и те же байты
+        начиная с offset: так загрузка продолжается с последнего принятого
+        байта и после сбоя сети, и после перезапуска (по session_uri).
         """
-        total = path.stat().st_size
         chunk_size = max(CHUNK_ALIGN, chunk_size // CHUNK_ALIGN * CHUNK_ALIGN)
         offset = 0
         if session_uri:
@@ -211,21 +223,42 @@ class YouTubeClient:
         if not session_uri:
             session_uri = await self._create_session(refresh_token, total, metadata)
             await on_session(session_uri)
+            offset = 0
 
+        # buffer — прочитанные из источника байты [buffer_start, buffer_start + len(buffer))
+        buffer = bytearray()
+        buffer_start = offset
+        source = open_stream(offset)
         failures = 0
-        with path.open("rb") as file:
+        try:
             while True:
-                file.seek(offset)
-                chunk = file.read(chunk_size)
+                if not buffer_start <= offset <= buffer_start + len(buffer):
+                    await source.aclose()
+                    source = open_stream(offset)
+                    buffer, buffer_start = bytearray(), offset
+                elif offset > buffer_start:
+                    # Новый буфер из хвоста, а не del buffer[:n]: иначе bytearray
+                    # при дописывании в конец выделяет память с запасом на удалённое начало
+                    buffer = buffer[offset - buffer_start :]
+                    buffer_start = offset
+                while len(buffer) < chunk_size and buffer_start + len(buffer) < total:
+                    try:
+                        buffer += await anext(source)
+                    except StopAsyncIteration:
+                        raise YouTubeError("источник закончился раньше заявленного размера") from None
+                if buffer_start + len(buffer) > total:
+                    raise YouTubeError("источник длиннее заявленного размера")
+                size = min(chunk_size, len(buffer))
                 started = time.monotonic()
                 problem: Exception
                 try:
                     resp = await self._http.put(
                         session_uri,
-                        content=chunk,
+                        content=_body(buffer, size),
                         headers={
                             **await self._auth(refresh_token),
-                            "Content-Range": f"bytes {offset}-{offset + len(chunk) - 1}/{total}",
+                            "Content-Length": str(size),
+                            "Content-Range": f"bytes {offset}-{offset + size - 1}/{total}",
                         },
                         timeout=httpx.Timeout(60.0, read=600.0, write=600.0),
                     )
@@ -239,7 +272,7 @@ class YouTubeClient:
                         offset = _received_bytes(resp)
                         failures = 0
                         await on_progress(offset * 100 // total)
-                        await self._throttle(len(chunk), started, limit_mbit)
+                        await self._throttle(size, started, limit_mbit)
                         continue
                     if resp.status_code not in RETRYABLE_STATUS:
                         raise _error(resp)
@@ -259,6 +292,43 @@ class YouTubeClient:
                 if state is None:
                     raise YouTubeError("сессия загрузки истекла")
                 offset = state
+        finally:
+            await source.aclose()
+
+    # --- состояние и публикация ---
+
+    async def videos(self, refresh_token: str, ids: list[str]) -> dict[str, dict]:
+        """Состояние роликов по ID. Удалённых роликов в ответе нет. 1 единица квоты на 50 роликов."""
+        result: dict[str, dict] = {}
+        for i in range(0, len(ids), 50):
+            resp = await self._http.get(
+                f"{API_URL}/videos",
+                params={"part": "status,processingDetails,contentDetails", "id": ",".join(ids[i : i + 50])},
+                headers=await self._auth(refresh_token),
+            )
+            if resp.status_code != 200:
+                raise _error(resp)
+            for item in resp.json().get("items") or []:
+                result[item["id"]] = item
+        return result
+
+    async def set_privacy(self, refresh_token: str, video_id: str, privacy: str, current: dict) -> dict:
+        """Меняет доступ к ролику и возвращает новый status. 50 единиц квоты.
+
+        videos.update заменяет status целиком, поэтому изменяемые поля
+        переносятся из текущего состояния.
+        """
+        status = {key: current[key] for key in ("embeddable", "license", "publicStatsViewable") if key in current}
+        status.update(privacyStatus=privacy, selfDeclaredMadeForKids=False, containsSyntheticMedia=False)
+        resp = await self._http.put(
+            f"{API_URL}/videos",
+            params={"part": "status"},
+            json={"id": video_id, "status": status},
+            headers=await self._auth(refresh_token),
+        )
+        if resp.status_code != 200:
+            raise _error(resp)
+        return resp.json().get("status") or {}
 
     async def _create_session(self, refresh_token: str, total: int, metadata: dict) -> str:
         resp = await self._http.post(

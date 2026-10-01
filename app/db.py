@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,13 +21,17 @@ def as_utc(value: datetime) -> datetime:
 
 
 class Status:
-    PENDING = "pending"  # ждёт проверки
-    APPROVED = "approved"  # одобрен, в очереди
-    DOWNLOADING = "downloading"
+    SKIPPED = "skipped"  # не загружается: похоже на просмотр сериала или фильма
+    QUEUED = "queued"  # ждёт загрузки
     UPLOADING = "uploading"
-    UPLOADED = "uploaded"
-    REJECTED = "rejected"
-    FAILED = "failed"
+    PROCESSING = "processing"  # загружен приватно, YouTube обрабатывает
+    WAITING = "waiting"  # обработан, ждём проверку Content ID перед публикацией
+    REVIEW = "review"  # есть предупреждения: публикация только по решению в Telegram
+    PUBLISHED = "published"
+    PRIVATE = "private"  # оставлен приватным по решению
+    LOCKED = "locked"  # YouTube не дал опубликовать
+    REJECTED = "rejected"  # YouTube отклонил ролик или не смог его обработать
+    FAILED = "failed"  # загрузка не удалась, можно повторить
 
 
 class Base(DeclarativeBase):
@@ -52,6 +57,7 @@ class Vod(Base):
     title: Mapped[str] = mapped_column(String(512))
     started_at: Mapped[datetime | None]
     duration: Mapped[int]
+    playlist_url: Mapped[str | None] = mapped_column(Text)  # HLS-плейлист исходного качества
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
@@ -66,12 +72,20 @@ class Segment(Base):
     category: Mapped[str] = mapped_column(String(256))
     part: Mapped[int | None]
     title: Mapped[str] = mapped_column(String(256))
-    status: Mapped[str] = mapped_column(String(16), default=Status.PENDING, index=True)
+    status: Mapped[str] = mapped_column(String(16), default=Status.QUEUED, index=True)
+    reason: Mapped[str | None] = mapped_column(Text)  # почему пропущен или отклонён
+    warnings: Mapped[str | None] = mapped_column(Text)  # JSON-список предупреждений
+    force_review: Mapped[bool] = mapped_column(default=False)  # загружен вопреки фильтру
     progress: Mapped[int] = mapped_column(default=0)
-    queued_at: Mapped[datetime | None]  # когда одобрен: очередь идёт по порядку одобрения
-    local_path: Mapped[str | None] = mapped_column(String(512))  # скачанный и проверенный файл
+    queued_at: Mapped[datetime | None]  # очередь загрузки идёт по этому времени
     upload_uri: Mapped[str | None] = mapped_column(Text)  # сессия resumable upload для докачки
+    upload_total: Mapped[int | None] = mapped_column(BigInteger)  # размер ролика в байтах
+    expected_duration: Mapped[int | None]  # секунд, для сверки с YouTube
     youtube_id: Mapped[str | None] = mapped_column(String(32))
+    check_at: Mapped[datetime | None] = mapped_column(index=True)  # когда проверить на YouTube
+    publish_after: Mapped[datetime | None]
+    published_at: Mapped[datetime | None]
+    monitor_until: Mapped[datetime | None]
     error: Mapped[str | None] = mapped_column(Text)
     tg_message_id: Mapped[int | None] = mapped_column(BigInteger)
 
@@ -81,6 +95,14 @@ class KV(Base):
 
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str] = mapped_column(Text)
+
+
+def get_warnings(seg: Segment) -> list[str]:
+    return json.loads(seg.warnings) if seg.warnings else []
+
+
+def dump_warnings(warnings: list[str]) -> str | None:
+    return json.dumps(warnings, ensure_ascii=False) if warnings else None
 
 
 def make_engine(path: Path) -> AsyncEngine:
@@ -97,7 +119,8 @@ def make_engine(path: Path) -> AsyncEngine:
 
 
 async def init_db(engine: AsyncEngine) -> None:
-    # Пока схема не менялась, таблицы создаются напрямую; миграции Alembic появятся с первым изменением
+    # Пока схема не менялась на рабочем сервере, таблицы создаются напрямую;
+    # миграции Alembic появятся с первым изменением после запуска
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 

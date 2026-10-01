@@ -127,6 +127,49 @@ def _merge_same(segments: List[PlannedSegment]) -> List[PlannedSegment]:
     return merged
 
 
+# --- что загружать ---
+
+
+def split_list(value: Optional[str]) -> List[str]:
+    """«a, b,,c» → ["a", "b", "c"]: списки в .env пишутся через запятую."""
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
+
+
+def _fold(text: Optional[str]) -> str:
+    return (text or "").casefold().replace("ё", "е")
+
+
+def skip_reason(
+    category: str,
+    stream_title: str,
+    *,
+    keywords: Iterable[str],
+    title_categories: Iterable[str],
+    categories: Iterable[str],
+) -> Optional[str]:
+    """Почему сегмент не загружается, или None.
+
+    Просмотр сериалов и фильмов Twitch отдельной категорией не отмечает: он
+    идёт под Just Chatting, а узнать его можно по названию стрима.
+    """
+    folded = _fold(category)
+    if folded in {_fold(item) for item in categories}:
+        return f"категория «{category}» не загружается"
+    if folded in {_fold(item) for item in title_categories}:
+        title = _fold(stream_title)
+        for keyword in keywords:
+            if _fold(keyword) and _fold(keyword) in title:
+                return f"похоже на просмотр сериала или фильма: в названии стрима «{keyword}»"
+    return None
+
+
+def category_warnings(category: str, warn_categories: Iterable[str]) -> List[str]:
+    """Предупреждения, известные ещё до загрузки."""
+    if _fold(category) in {_fold(item) for item in warn_categories}:
+        return [f"категория «{category}» в списке рискованных"]
+    return []
+
+
 # --- метаданные для YouTube ---
 
 _ANGLE_BRACKETS = re.compile(r"[<>]")

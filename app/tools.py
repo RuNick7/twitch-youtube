@@ -1,4 +1,4 @@
-"""Внешние инструменты: yt-dlp, ffprobe, pip."""
+"""Внешние инструменты: yt-dlp и pip."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +25,7 @@ class VodInfo:
     started_at: datetime | None
     is_live: bool
     chapters: list[dict] = field(default_factory=list)
+    playlist_url: str | None = None  # HLS-плейлист исходного качества
 
 
 def vod_url(vod_id: str) -> str:
@@ -51,12 +51,16 @@ async def run(*cmd: str, timeout: float | None = None) -> tuple[int, str, str]:
 
 
 async def fetch_vod_info(vod_id: str) -> VodInfo:
-    """Метаданные и главы VOD без скачивания видео."""
-    code, out, err = await run("yt-dlp", "-J", "--no-warnings", vod_url(vod_id), timeout=180)
+    """Метаданные, главы и плейлист VOD без скачивания видео."""
+    code, out, err = await run("yt-dlp", "-J", "-f", "best", "--no-warnings", vod_url(vod_id), timeout=180)
     if code != 0:
         raise ToolError(_tail(err) or f"yt-dlp завершился с кодом {code}")
-    data = json.loads(out)
+    try:
+        data = json.loads(out)
+    except ValueError as exc:
+        raise ToolError("yt-dlp вернул не JSON") from exc
     timestamp = data.get("timestamp")
+    protocol = str(data.get("protocol") or "")
     return VodInfo(
         id=str(data.get("id") or vod_id).lstrip("v"),
         title=data.get("title") or "",
@@ -66,41 +70,20 @@ async def fetch_vod_info(vod_id: str) -> VodInfo:
         started_at=datetime.fromtimestamp(timestamp, tz=timezone.utc) if timestamp else None,
         is_live=bool(data.get("is_live")),
         chapters=list(data.get("chapters") or []),
+        playlist_url=data.get("url") if protocol.startswith("m3u8") else None,
     )
 
 
-async def download_section(vod_id: str, start: int, end: int, dest_stem: Path) -> Path:
-    """Скачивает кусок VOD [start, end) в исходном качестве, без перекодирования."""
-    for leftover in dest_stem.parent.glob(dest_stem.name + ".*"):
-        leftover.unlink(missing_ok=True)
+async def list_channel_vods(channel: str, limit: int = 5) -> list[str]:
+    """ID последних записей эфиров канала, новые первыми."""
     code, out, err = await run(
-        "nice", "-n", "10",
-        "yt-dlp", "--no-warnings", "--no-progress",
-        "-f", "best",
-        "--download-sections", f"*{start}-{end}",
-        "-o", f"{dest_stem}.%(ext)s",
-        "--print", "after_move:filepath", "--no-simulate",
-        vod_url(vod_id),
-        # даже на медленном канале кусок качается быстрее, чем длится
-        timeout=max(1800, end - start),
+        "yt-dlp", "--no-warnings", "--flat-playlist", "-I", f"1:{limit}", "--print", "id",
+        f"https://www.twitch.tv/{channel}/videos?filter=archives&sort=time",
+        timeout=120,
     )
     if code != 0:
         raise ToolError(_tail(err) or f"yt-dlp завершился с кодом {code}")
-    lines = [line for line in out.splitlines() if line.strip()]
-    path = Path(lines[-1]) if lines else None
-    if path is None or not path.exists():
-        raise ToolError("yt-dlp не сообщил, куда сохранил файл")
-    return path
-
-
-async def probe(path: Path) -> dict:
-    code, out, err = await run(
-        "ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path),
-        timeout=300,
-    )
-    if code != 0:
-        raise ToolError(_tail(err) or "ffprobe не смог прочитать файл")
-    return json.loads(out)
+    return [line.strip().lstrip("v") for line in out.splitlines() if line.strip()]
 
 
 async def ytdlp_version() -> str:
