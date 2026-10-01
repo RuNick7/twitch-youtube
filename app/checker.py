@@ -14,6 +14,7 @@ from .checks import FAILED, READY, REJECTED, failure_reason, processing_state, y
 from .context import App
 from .db import Segment, Status, Streamer, Vod, as_utc, dump_warnings, get_warnings, utcnow
 from .service import MONITOR_EVERY, publish, update_segment
+from .ui import PRIVACY_NAMES
 from .worker import is_paused, set_paused
 from .youtube import AuthError, YouTubeError
 
@@ -22,7 +23,6 @@ log = logging.getLogger(__name__)
 TICK_SEC = 60
 RECHECK = timedelta(minutes=5)
 AUTH_BACKOFF = timedelta(minutes=10)
-PRIVACY_NAMES = {"private": "приватным", "unlisted": "доступным только по ссылке", "public": "публичным"}
 
 
 def _unique(items: list[str]) -> list[str]:

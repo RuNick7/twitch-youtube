@@ -32,6 +32,7 @@ class Status:
     LOCKED = "locked"  # YouTube не дал опубликовать
     REJECTED = "rejected"  # YouTube отклонил ролик или не смог его обработать
     FAILED = "failed"  # загрузка не удалась, можно повторить
+    FORGOTTEN = "forgotten"  # данные о ролике удалены: канал отключён или ролика больше нет на YouTube
 
 
 class Base(DeclarativeBase):

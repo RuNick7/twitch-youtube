@@ -13,7 +13,7 @@ from sqlalchemy import select, update
 from .context import App
 from .db import Segment, Status, Streamer, Vod, get_spans, kv_get, kv_set, utcnow
 from .hls import Plan, SourceError, build_plan, stream
-from .service import build_metadata, update_segment
+from .service import DISCONNECTED_REASON, build_metadata, update_segment
 from .tools import fetch_vod_info
 from .youtube import LIMIT_REASONS, AuthError, YouTubeError
 
@@ -103,6 +103,11 @@ class Worker:
             await app.notify(f"🔴 Обработка на паузе: {escape(str(exc))}", reply_to=seg.tg_message_id)
             return
         except Exception as exc:
+            if not await self._connected(streamer):
+                # Канал отключили во время загрузки: сегмент загрузится заново после нового подключения
+                await update_segment(app, segment_id, status=Status.QUEUED, upload_uri=None)
+                await app.refresh_segment(segment_id)
+                return
             log.exception("Сегмент %s не загружен", segment_id)
             await update_segment(app, segment_id, status=Status.FAILED, error=str(exc)[:1000])
             await app.refresh_segment(segment_id)
@@ -112,6 +117,11 @@ class Worker:
             )
             return
 
+        if not await self._connected(streamer):
+            # Ролик загрузился, но канал успели отключить: его ID не сохраняем
+            await update_segment(app, segment_id, status=Status.FORGOTTEN, reason=DISCONNECTED_REASON, upload_uri=None)
+            await app.refresh_segment(segment_id)
+            return
         await update_segment(
             app,
             segment_id,
@@ -123,6 +133,12 @@ class Worker:
             check_at=utcnow() + FIRST_CHECK_AFTER,
         )
         await app.refresh_segment(segment_id)
+
+    async def _connected(self, streamer: Streamer) -> bool:
+        """Действует ли тот же доступ к YouTube, с которым началась загрузка."""
+        async with self.app.sessions() as session:
+            current = await session.get(Streamer, streamer.id)
+        return current.youtube_token == streamer.youtube_token
 
     async def _plan(self, seg: Segment, vod: Vod) -> Plan:
         if vod.playlist_url:

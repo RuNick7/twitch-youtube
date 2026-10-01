@@ -39,6 +39,31 @@ MONITOR_EVERY = timedelta(hours=6)
 PUBLISHABLE = (Status.WAITING, Status.REVIEW, Status.PRIVATE)
 LOCKED_REASON = "ролик остался приватным: скорее всего, Google-проект ещё не прошёл аудит YouTube API"
 
+# Сегменты, у которых есть ролик на YouTube
+UPLOADED = (
+    Status.PROCESSING,
+    Status.WAITING,
+    Status.REVIEW,
+    Status.PUBLISHED,
+    Status.PRIVATE,
+    Status.LOCKED,
+    Status.REJECTED,
+)
+# Что AutoVOD узнал о ролике от YouTube
+YOUTUBE_FIELDS = dict(
+    youtube_id=None,
+    upload_uri=None,
+    warnings=None,
+    error=None,
+    check_at=None,
+    publish_after=None,
+    published_at=None,
+    monitor_until=None,
+)
+DISCONNECTED_REASON = "YouTube-канал отключён: данные о ролике удалены"
+REVOKED_REASON = "доступ к YouTube отозван: данные о ролике удалены"
+DELETED_REASON = "ролика больше нет на YouTube: данные о нём удалены"
+
 _publishing: set[int] = set()
 
 
@@ -172,6 +197,43 @@ async def set_status(app: App, segment_id: int, allowed_from: tuple[str, ...], t
             .values(status=to, **values)
         )
     return result.rowcount == 1
+
+
+async def forget_youtube(app: App, streamer_id: int, reason: str) -> None:
+    """Удаляет всё, что AutoVOD получил от YouTube для канала: токен, ID и название канала, ID и состояние роликов.
+
+    Правила YouTube API требуют этого после отзыва доступа. Сами ролики остаются на YouTube,
+    а сегменты, которые ещё не загружены, ждут в очереди нового подключения.
+    """
+    vods = select(Vod.id).where(Vod.streamer_id == streamer_id)
+    async with app.sessions() as session, session.begin():
+        streamer = await session.get(Streamer, streamer_id)
+        if streamer.youtube_token:
+            app.youtube.forget(app.vault.decrypt(streamer.youtube_token))
+        streamer.youtube_token = streamer.youtube_channel_id = streamer.youtube_channel_title = None
+        # У этих сегментов в Telegram кнопки, которые больше ничего не сделают
+        with_buttons = list(
+            (
+                await session.scalars(
+                    select(Segment.id).where(Segment.vod_id.in_(vods), Segment.status.in_(PUBLISHABLE))
+                )
+            ).all()
+        )
+        await session.execute(
+            update(Segment)
+            .where(Segment.vod_id.in_(vods), Segment.status.in_(UPLOADED))
+            .values(status=Status.FORGOTTEN, reason=reason, **YOUTUBE_FIELDS)
+        )
+        await session.execute(
+            update(Segment)
+            .where(Segment.vod_id.in_(vods), Segment.status == Status.UPLOADING)
+            .values(status=Status.QUEUED)
+        )
+        await session.execute(
+            update(Segment).where(Segment.vod_id.in_(vods), Segment.upload_uri.is_not(None)).values(upload_uri=None)
+        )
+    for segment_id in with_buttons:
+        await app.refresh_segment(segment_id)
 
 
 async def status_counts(app: App) -> dict[str, int]:

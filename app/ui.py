@@ -9,10 +9,16 @@ from zoneinfo import ZoneInfo
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from .config import Settings
 from .db import Segment, Status, Streamer, Vod, as_utc, get_spans, get_warnings
 from .segments import fmt_duration, fmt_spans, twitch_time_param
 
 PUBLISH, KEEP, RETRY, FORCE = "pub", "keep", "rt", "force"
+CONNECT, DISCONNECT, CANCEL = "on", "off", "cancel"
+
+YOUTUBE_TERMS_URL = "https://www.youtube.com/t/terms"
+GOOGLE_PRIVACY_URL = "https://www.google.com/policies/privacy"
+PRIVACY_NAMES = {"private": "приватным", "unlisted": "доступным только по ссылке", "public": "публичным"}
 
 
 class SegmentAction(CallbackData, prefix="seg"):
@@ -20,8 +26,60 @@ class SegmentAction(CallbackData, prefix="seg"):
     id: int
 
 
+class YouTubeAction(CallbackData, prefix="yt"):
+    action: str
+
+
 def _button(text: str, action: str, segment_id: int) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=SegmentAction(action=action, id=segment_id).pack())
+
+
+def confirm_keyboard(text: str, action: str) -> InlineKeyboardMarkup:
+    """Подтверждение подключения или отключения канала."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=text, callback_data=YouTubeAction(action=action).pack()),
+                InlineKeyboardButton(text="Отмена", callback_data=YouTubeAction(action=CANCEL).pack()),
+            ]
+        ]
+    )
+
+
+def render_consent(settings: Settings, streamer_name: str) -> str:
+    """Что AutoVOD будет делать с каналом. Правила YouTube API требуют показать это
+    и получить согласие с политикой конфиденциальности до входа."""
+    privacy = PRIVACY_NAMES[settings.publish_privacy]
+    if settings.auto_publish:
+        publishing = (
+            f"делать ролик {privacy} через {settings.publish_delay_min} мин после обработки, если YouTube "
+            "не выдал предупреждений, а ролик с предупреждениями — только по вашей кнопке"
+        )
+    else:
+        publishing = f"делать ролик {privacy} только по вашей кнопке «Опубликовать»"
+    return (
+        "<b>Подключение YouTube-канала</b>\n\n"
+        "С доступом к каналу AutoVOD будет:\n"
+        f"• загружать на него сегменты стримов {escape(streamer_name)} приватными роликами;\n"
+        f"• {publishing};\n"
+        "• проверять состояние загруженных им роликов.\n\n"
+        "Другие ролики, комментарии, плейлисты и статистику канала AutoVOD не трогает. Он хранит зашифрованный "
+        "токен доступа, ID и название канала, ID и состояние своих роликов и раз в сутки сверяет их с YouTube. "
+        "Отключить канал и удалить эти данные — /disconnect.\n\n"
+        f'Нажимая «Принимаю», вы соглашаетесь с <a href="{escape(settings.privacy_url)}">политикой '
+        f'конфиденциальности</a> и <a href="{escape(settings.terms_url)}">условиями использования</a> AutoVOD '
+        f'и с <a href="{YOUTUBE_TERMS_URL}">Условиями использования YouTube</a>. Как Google обращается с данными: '
+        f'<a href="{GOOGLE_PRIVACY_URL}">Политика конфиденциальности Google</a>.'
+    )
+
+
+def render_disconnect(channel_title: str) -> str:
+    return (
+        f"Отключить YouTube-канал «{escape(channel_title)}»?\n\n"
+        "AutoVOD отзовёт доступ в Google и удалит из своей базы токен, ID и название канала, ID и состояние "
+        "загруженных роликов. Сами ролики останутся на YouTube: удалить их можно в YouTube Studio. "
+        "Загрузка и публикация встанут на паузу до нового подключения."
+    )
 
 
 def twitch_link(vod_id: str, seconds: int) -> str:
@@ -86,6 +144,8 @@ def status_line(seg: Segment, tz: ZoneInfo, privacy: str) -> str:
         return f"🔴 YouTube отклонил ролик: {reason}. {link}"
     if seg.status == Status.FAILED:
         return f"🔴 Ошибка: {escape((seg.error or '')[:500])}"
+    if seg.status == Status.FORGOTTEN:
+        return f"🗑 {reason}"
     return seg.status
 
 

@@ -1,7 +1,8 @@
-"""Сквозной тест: слежение за каналом, фильтр, потоковая загрузка, проверки, автопубликация.
+"""Сквозной тест: слежение за каналом, фильтр, потоковая загрузка, проверки, автопубликация,
+ежедневная сверка с YouTube, отключение канала и отзыв доступа.
 
 Настоящие: код приложения (app.__main__.main), Twitch (главы, плейлисты и фрагменты VOD), yt-dlp, SQLite.
-Поддельные: Telegram Bot API и Google (OAuth, upload, videos.list, videos.update).
+Поддельные: Telegram Bot API и Google (OAuth и отзыв токена, upload, channels.list, videos.list, videos.update).
 Слежение за каналом получает список VOD из подставной функции, но видео берёт с настоящего Twitch.
 
 Запуск описан в README («Тесты»). Twitch удаляет записи через 60 дней: когда VOD ниже
@@ -53,6 +54,7 @@ os.environ.update(
 import app.__main__ as entry  # noqa: E402
 import app.checker as checker_mod  # noqa: E402
 import app.hls as hls  # noqa: E402
+import app.refresher as refresher_mod  # noqa: E402
 import app.service as service_mod  # noqa: E402
 import app.watcher as watcher_mod  # noqa: E402
 import app.worker as worker_mod  # noqa: E402
@@ -60,19 +62,21 @@ import app.youtube as yt  # noqa: E402
 import httpx  # noqa: E402
 from aiogram import Bot  # noqa: E402
 from aiogram.client.session.base import BaseSession  # noqa: E402
-from sqlalchemy import select, update  # noqa: E402
+from sqlalchemy import delete, select, update  # noqa: E402
 from sqlalchemy.ext.asyncio import async_sessionmaker  # noqa: E402
 
-from app.db import Segment, Status, TitleChange, Vod, get_spans, get_warnings, make_engine  # noqa: E402
+from app.db import KV, Segment, Status, Streamer, TitleChange, Vod, get_spans, get_warnings, make_engine  # noqa: E402
 from app.tools import VodInfo, fetch_vod_info  # noqa: E402
 from app.twitch import LiveState  # noqa: E402
 
 yt.DEVICE_CODE_URL = f"{BASE}/device/code"
 yt.TOKEN_URL = f"{BASE}/token"
+yt.REVOKE_URL = f"{BASE}/revoke"
 yt.UPLOAD_URL = f"{BASE}/upload/youtube/v3/videos"
 yt.API_URL = f"{BASE}/youtube/v3"
-# ускоряем таймеры: в жизни это минуты и часы
+# ускоряем таймеры: в жизни это минуты и часы. Ежедневная сверка запускается в тесте сбросом отметки в базе
 checker_mod.TICK_SEC = 1
+refresher_mod.TICK_SEC = 1
 checker_mod.RECHECK = timedelta(seconds=1)
 checker_mod.MONITOR_EVERY = service_mod.MONITOR_EVERY = timedelta(seconds=3)
 worker_mod.FIRST_CHECK_AFTER = timedelta(seconds=1)
@@ -170,10 +174,13 @@ class FakeTelegram(BaseSession):
     def push_callback(self, uid, data, message_id):
         n = self.next_update_id
         self.next_update_id += 1
+        stored = self.messages.get(message_id, {})
+        message = {"message_id": message_id, "date": int(time.time()), "chat": {"id": uid, "type": "private"},
+                   "text": stored.get("text", "")}
+        if stored.get("markup") is not None:  # как в настоящем Telegram: сообщение приходит вместе с кнопками
+            message["reply_markup"] = json.loads(markup_json(stored["markup"]))
         self.updates.put_nowait({"update_id": n, "callback_query": {
-            "id": f"cb{n}", "from": self._user(uid), "chat_instance": "ci", "data": data,
-            "message": {"message_id": message_id, "date": int(time.time()), "chat": {"id": uid, "type": "private"},
-                        "text": self.messages.get(message_id, {}).get("text", "")}}})
+            "id": f"cb{n}", "from": self._user(uid), "chat_instance": "ci", "data": data, "message": message}})
 
     def _check(self, name, method):
         text = getattr(method, "text", None)
@@ -274,11 +281,16 @@ class FakeGoogle:
         self.videos: dict[str, dict] = {}
         self.updates: list[dict] = []
         self.violations: list[str] = []
+        self.issued = 0  # выдано refresh-токенов: RT-1, RT-2, …
+        self.revoked: set[str] = set()
+        self.revoke_calls: list[str] = []
+        self.channel_title = "Тестовый канал"
 
     def app(self):
         app = web.Application(client_max_size=64 * 1024**2)
         app.router.add_post("/device/code", self.device_code)
         app.router.add_post("/token", self.token)
+        app.router.add_post("/revoke", self.revoke)
         app.router.add_get("/youtube/v3/channels", self.channels)
         app.router.add_get("/youtube/v3/videos", self.list_videos)
         app.router.add_put("/youtube/v3/videos", self.update_video)
@@ -299,19 +311,42 @@ class FakeGoogle:
             self.device_polls += 1
             if self.device_polls < 2:
                 return web.json_response({"error": "authorization_pending"}, status=428)
-            return web.json_response({"access_token": "AT-1", "expires_in": 3599, "refresh_token": "RT-1"})
-        return web.json_response({"access_token": "AT-2", "expires_in": 3599})
+            self.issued += 1
+            rt = f"RT-{self.issued}"
+            return web.json_response({"access_token": f"AT-{rt}", "expires_in": 3599, "refresh_token": rt})
+        rt = form.get("refresh_token")
+        if rt in self.revoked:
+            return web.json_response({"error": "invalid_grant", "error_description": "Token has been expired or revoked."},
+                                     status=400)
+        return web.json_response({"access_token": f"AT-{rt}", "expires_in": 3599})
+
+    async def revoke(self, request):
+        token = (await request.post()).get("token")
+        self.revoke_calls.append(token)
+        if token in self.revoked:
+            return web.json_response({"error": "invalid_token", "error_description": "Token expired or revoked"}, status=400)
+        self.revoked.add(token)
+        return web.Response(status=200)
 
     def _auth(self, request):
-        if not request.headers.get("Authorization", "").startswith("Bearer AT-"):
+        """Ответ 401, если токен доступа выдан по отозванному refresh-токену, иначе None."""
+        header = request.headers.get("Authorization", "")
+        if not header.startswith("Bearer AT-"):
             self.violations.append(f"без токена: {request.method} {request.path}")
+            return None
+        if header.removeprefix("Bearer AT-") in self.revoked:
+            return web.json_response({"error": {"code": 401, "message": "Invalid Credentials",
+                                                "errors": [{"reason": "authError"}]}}, status=401)
+        return None
 
     async def channels(self, request):
-        self._auth(request)
-        return web.json_response({"items": [{"id": "UCtest", "snippet": {"title": "Тестовый канал"}}]})
+        if (denied := self._auth(request)) is not None:
+            return denied
+        return web.json_response({"items": [{"id": "UCtest", "snippet": {"title": self.channel_title}}]})
 
     async def create(self, request):
-        self._auth(request)
+        if (denied := self._auth(request)) is not None:
+            return denied
         total = int(request.headers["X-Upload-Content-Length"])
         meta = await request.json()
         st = meta.get("status", {})
@@ -335,7 +370,8 @@ class FakeGoogle:
         s = self.sessions.get(sid)
         if s is None:
             return web.Response(status=404)
-        self._auth(request)
+        if (denied := self._auth(request)) is not None:
+            return denied
         content_range = request.headers.get("Content-Range", "")
         if not content_range.startswith("bytes */") and (
             "chunked" in request.headers.get("Transfer-Encoding", "").lower() or not request.headers.get("Content-Length")
@@ -393,14 +429,16 @@ class FakeGoogle:
                 "processingDetails": {"processingStatus": "succeeded" if processed else "processing"}}
 
     async def list_videos(self, request):
-        self._auth(request)
+        if (denied := self._auth(request)) is not None:
+            return denied
         if request.query.get("part") != "status,processingDetails,contentDetails":
             self.violations.append(f"videos.list part={request.query.get('part')}")
         ids = [i for i in request.query.get("id", "").split(",") if i]
         return web.json_response({"items": [self._item(i) for i in ids if i in self.videos]})
 
     async def update_video(self, request):
-        self._auth(request)
+        if (denied := self._auth(request)) is not None:
+            return denied
         body = await request.json()
         self.updates.append(body)
         v = self.videos.get(body.get("id"))
@@ -564,8 +602,15 @@ async def main():
     t0 = time.monotonic()
     print("\n== 1. Запуск, YouTube, пауза", flush=True)
     task = await start_app()
-    tg.push_text(OWNER, "/youtube")
+    reply = await say("/youtube")
+    consent = reply[-1][0]
+    text = tg.messages[consent]["text"]
+    check("приватными роликами" in text and "политикой" in text and "Условиями использования YouTube" in text
+          and "/disconnect" in text and tg.find("ABCD-EFGH") is None,
+          "до входа бот объясняет, что будет делать с каналом, и просит принять политику", text)
+    await press(consent, "✅")
     mid = await wait_for(lambda: tg.find("ABCD-EFGH"), 30, "код")
+    check(not tg.messages[consent]["markup"], "после согласия кнопки под условиями убраны")
     await wait_for(lambda: "Подключён канал" in tg.messages[mid]["text"], 30, "канал")
     check(True, "YouTube подключён по коду")
     reply = await say("/pause")
@@ -774,7 +819,67 @@ async def main():
     _, err = await proc.communicate()
     check(not err.strip(), "полное декодирование этого ролика без ошибок", err[:300])
 
-    print("\n== 11. Протоколы и итог", flush=True)
+    print("\n== 11. Ежедневная сверка, отключение канала и отзыв доступа", flush=True)
+
+    async def run_daily_check():
+        async with db() as s, s.begin():
+            await s.execute(delete(KV).where(KV.key == refresher_mod.CHECKED_KEY))
+
+    async def streamer_row():
+        async with db() as s:
+            return (await s.scalars(select(Streamer))).one()
+
+    uploaded = [s_mc.id, n_jc.id, n_mc.id, s_jc.id, w_mc.id, w_jc.id]
+    google.videos.pop((await seg(s_mc.id)).youtube_id)  # отклонённый ролик удалили в YouTube Studio
+    google.videos[(await seg(w_mc.id)).youtube_id]["privacy"] = "public"  # а заблокированный открыли там вручную
+    google.channel_title = "Канал после переименования"
+    await run_daily_check()
+    row = await wait_for(lambda: status_in(s_mc.id, (Status.FORGOTTEN,)), 30, "сверка роликов")
+    check(row.youtube_id is None and "больше нет на YouTube" in (row.reason or ""),
+          "ролик, удалённый с YouTube, забыт при ежедневной сверке", (row.youtube_id, row.reason))
+    check("🗑" in tg.messages[s_mc.tg_message_id]["text"], "в сообщении сегмента видно, что данные удалены")
+    row = await wait_for(lambda: status_in(w_mc.id, (Status.PUBLISHED,)), 30, "доступ, изменённый в Studio")
+    check(row.youtube_id, "ролик, открытый вручную в YouTube Studio, отмечен опубликованным")
+    check(all([(await seg(i)).youtube_id for i in uploaded if i != s_mc.id]), "остальные ролики на месте")
+    check((await streamer_row()).youtube_channel_title == "Канал после переименования", "название канала обновлено")
+
+    reply = await say("/disconnect")
+    confirm = reply[-1][0]
+    await press(confirm, "Отмена")
+    check(not tg.messages[confirm]["markup"] and (await streamer_row()).youtube_token, "«Отмена» ничего не отключает")
+    reply = await say("/disconnect")
+    confirm = reply[-1][0]
+    check("останутся на YouTube" in tg.messages[confirm]["text"], "/disconnect предупреждает, что ролики на YouTube останутся")
+    await press(confirm, "🔌")
+    await wait_for(lambda: "отключён" in tg.messages[confirm]["text"], 30, "отключение")
+    streamer = await streamer_row()
+    rows = [await seg(i) for i in uploaded]
+    check(google.revoke_calls == ["RT-1"], "доступ отозван в Google", google.revoke_calls)
+    check(streamer.youtube_token is None and streamer.youtube_channel_id is None and streamer.youtube_channel_title is None,
+          "токен и данные канала удалены")
+    async with db() as s:
+        leftovers = (await s.scalars(select(Segment).where(
+            (Segment.youtube_id.is_not(None)) | (Segment.upload_uri.is_not(None))))).all()
+        paused = await s.get(KV, "paused")
+    check(not leftovers and all(r.status == Status.FORGOTTEN for r in rows),
+          "ID роликов и сессий загрузки удалены", [(r.status, r.youtube_id) for r in rows])
+    check(paused and paused.value == "1", "после отключения обработка на паузе")
+    check(buttons(tg.messages[s_jc.tg_message_id]["markup"]) == ["▶️ Twitch"],
+          "под роликом, ждавшим решения, остались только ссылки", buttons(tg.messages[s_jc.tg_message_id]["markup"]))
+
+    since = tg.next_message_id
+    reply = await say("/youtube")
+    await press(reply[-1][0], "✅")
+    mid = await wait_for(lambda: tg.find("Подключён канал", since), 30, "повторное подключение")
+    check("/resume" in tg.messages[mid]["text"], "после подключения бот напоминает, что обработка на паузе")
+    google.revoked.add("RT-2")  # владелец отозвал доступ на странице настроек Google
+    await run_daily_check()
+    alert = await wait_for(lambda: tg.find("Доступ к YouTube отозван", since), 30, "отзыв доступа замечен")
+    check(not tg.messages[alert]["silent"] and (await streamer_row()).youtube_token is None,
+          "отзыв доступа в Google замечен при сверке: данные удалены, пришло 🔴")
+    check(google.revoke_calls == ["RT-1"], "отозванный в Google токен бот повторно не отзывает", google.revoke_calls)
+
+    print("\n== 12. Протоколы и итог", flush=True)
     reply = await say("/status")
     print("   /status:", reply[-1][1]["text"].replace("\n", " | "))
     check(not tg.problems, "все тексты валидны для Telegram", tg.problems[:5])
