@@ -1,4 +1,4 @@
-"""Общий контекст приложения: настройки, база, бот, клиент YouTube."""
+"""Общий контекст приложения: настройки, база, бот, HTTP-клиент и клиент YouTube."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Coroutine
 from zoneinfo import ZoneInfo
 
+import httpx
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardMarkup, Message, ReplyParameters
@@ -27,20 +28,18 @@ class App:
     settings: Settings
     sessions: async_sessionmaker[AsyncSession]
     bot: Bot
+    http: httpx.AsyncClient
     youtube: YouTubeClient
     vault: Vault
     tz: ZoneInfo
-    wake: asyncio.Event = field(default_factory=asyncio.Event)  # будит обработчик очереди
+    wake: asyncio.Event = field(default_factory=asyncio.Event)  # будит очередь загрузки
     ytdlp_version: str = "?"
+    watch_state: str = "ещё не проверялся"  # для /status
     tasks: set[asyncio.Task] = field(default_factory=set)
 
     @property
     def owner_id(self) -> int | None:
         return self.settings.telegram_owner_id
-
-    @property
-    def private_uploads(self) -> bool:
-        return self.settings.youtube_privacy == "private"
 
     def spawn(self, coro: Coroutine) -> asyncio.Task:
         """Фоновая задача; ссылка хранится, чтобы её не собрал сборщик мусора."""
@@ -84,7 +83,7 @@ class App:
                 return
             vod = await session.get(Vod, seg.vod_id)
             streamer = await session.get(Streamer, vod.streamer_id)
-        text, markup = render_segment(seg, vod, streamer, self.tz, self.private_uploads)
+        text, markup = render_segment(seg, vod, streamer, self.tz, self.settings.publish_privacy)
         try:
             await self.bot.edit_message_text(
                 text=text, chat_id=self.owner_id, message_id=seg.tg_message_id, reply_markup=markup
