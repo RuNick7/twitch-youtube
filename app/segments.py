@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from dataclasses import dataclass, field
+from typing import Iterable, List, Optional, Tuple
 
 # YouTube принимает ролики до 12 часов; делим всё, что длиннее 11 ч 50 мин
 SPLIT_LIMIT_SEC = 12 * 3600 - 10 * 60
@@ -23,19 +23,31 @@ FALLBACK_CATEGORY = "Стрим"
 class Chapter:
     start: float
     end: float
-    title: str
+    title: str  # категория: так глава называется у Twitch
+    stream_title: Optional[str] = None  # название стрима на этом отрезке, если известно
 
 
 @dataclass
 class PlannedSegment:
-    start: int
-    end: int
+    start: int  # начало первого отрезка
+    end: int  # конец последнего отрезка
     category: str
-    part: Optional[int] = None  # номер части, если категория встречается несколько раз
+    part: Optional[int] = None  # номер, если такой же сегмент встречается несколько раз
+    stream_title: Optional[str] = None
+    ranges: List[Tuple[int, int]] = field(default_factory=list)  # пусто — один отрезок [start, end)
+
+    @property
+    def spans(self) -> List[Tuple[int, int]]:
+        """Отрезки VOD, из которых склеен ролик."""
+        return self.ranges or [(self.start, self.end)]
 
     @property
     def duration(self) -> int:
-        return self.end - self.start
+        return sum(end - start for start, end in self.spans)
+
+    @property
+    def key(self) -> Tuple[str, Optional[str]]:
+        return self.category, self.stream_title
 
 
 def normalize_chapters(
@@ -72,19 +84,50 @@ def normalize_chapters(
     return [chapter for chapter in chapters if chapter.end > chapter.start]
 
 
-def plan_segments(
-    chapters: List[Chapter], min_sec: int = 120, split_limit: int = SPLIT_LIMIT_SEC
-) -> List[PlannedSegment]:
-    """Каждая смена категории — отдельный сегмент.
+def split_by_titles(chapters: List[Chapter], marks: Iterable[Tuple[float, str]]) -> List[Chapter]:
+    """Режет главы ещё и по сменам названия стрима.
 
-    Куски короче min_sec (случайное переключение категории) приклеиваются к
-    предыдущему сегменту, а в начале стрима — к следующему. Сегменты длиннее
-    split_limit делятся на равные части. Если категория встречается несколько
-    раз, сегменты нумеруются: «часть 1», «часть 2».
+    marks — пары (секунда от начала VOD, название), замеченные во время эфира.
+    Первое название действует с начала VOD, даже если бот увидел его позже.
+    """
+    points = sorted((float(at), str(title).strip()) for at, title in marks if str(title or "").strip())
+    if not points:
+        return chapters
+    changes = [(0.0, points[0][1])]
+    for at, title in points[1:]:
+        if title != changes[-1][1]:
+            changes.append((max(at, 0.0), title))
+    result: List[Chapter] = []
+    for chapter in chapters:
+        cuts = [chapter.start] + [at for at, _ in changes if chapter.start < at < chapter.end] + [chapter.end]
+        for a, b in zip(cuts, cuts[1:]):
+            title = next(title for at, title in reversed(changes) if at <= a)
+            result.append(Chapter(a, b, chapter.title, title))
+    return result
+
+
+def plan_segments(
+    chapters: List[Chapter],
+    min_sec: int = 120,
+    split_limit: int = SPLIT_LIMIT_SEC,
+    no_part: Iterable[str] = (),
+    join: bool = False,
+) -> List[PlannedSegment]:
+    """Каждая смена категории или названия стрима — отдельный сегмент.
+
+    Куски короче min_sec (случайное переключение категории, исправленная
+    опечатка в названии) приклеиваются к предыдущему сегменту, а в начале
+    стрима — к следующему. С join повторы с той же категорией и тем же
+    названием склеиваются в один ролик из нескольких отрезков. Сегменты
+    длиннее split_limit делятся на равные части. Если одинаковые категория и
+    название всё же встречаются несколько раз, сегменты нумеруются: «часть 1»,
+    «часть 2» — кроме категорий из no_part.
     """
     segments = _merge_same(
         [
-            PlannedSegment(int(round(chapter.start)), int(round(chapter.end)), chapter.title)
+            PlannedSegment(
+                int(round(chapter.start)), int(round(chapter.end)), chapter.title, stream_title=chapter.stream_title
+            )
             for chapter in chapters
             if round(chapter.end) > round(chapter.start)
         ]
@@ -100,31 +143,78 @@ def plan_segments(
         del segments[short]
         segments = _merge_same(segments)
 
+    if join:
+        segments = _join_repeated(segments)
+
     result: List[PlannedSegment] = []
     for seg in segments:
         count = math.ceil(seg.duration / split_limit) if seg.duration > split_limit else 1
-        bounds = [seg.start + round(seg.duration * k / count) for k in range(count)] + [seg.end]
-        result.extend(PlannedSegment(a, b, seg.category) for a, b in zip(bounds, bounds[1:]))
+        cuts = [round(seg.duration * k / count) for k in range(1, count)]
+        for spans in _cut_spans(seg.spans, cuts):
+            result.append(
+                PlannedSegment(
+                    spans[0][0],
+                    spans[-1][1],
+                    seg.category,
+                    stream_title=seg.stream_title,
+                    ranges=spans if len(spans) > 1 else [],
+                )
+            )
 
+    unnumbered = {_fold(category) for category in no_part}
     totals: dict = {}
     for seg in result:
-        totals[seg.category] = totals.get(seg.category, 0) + 1
+        totals[seg.key] = totals.get(seg.key, 0) + 1
     seen: dict = {}
     for seg in result:
-        if totals[seg.category] > 1:
-            seen[seg.category] = seen.get(seg.category, 0) + 1
-            seg.part = seen[seg.category]
+        if totals[seg.key] > 1 and _fold(seg.category) not in unnumbered:
+            seen[seg.key] = seen.get(seg.key, 0) + 1
+            seg.part = seen[seg.key]
     return result
 
 
 def _merge_same(segments: List[PlannedSegment]) -> List[PlannedSegment]:
     merged: List[PlannedSegment] = []
     for seg in segments:
-        if merged and merged[-1].category == seg.category:
+        if merged and merged[-1].key == seg.key:
             merged[-1].end = seg.end
         else:
-            merged.append(PlannedSegment(seg.start, seg.end, seg.category))
+            merged.append(PlannedSegment(seg.start, seg.end, seg.category, stream_title=seg.stream_title))
     return merged
+
+
+def _join_repeated(segments: List[PlannedSegment]) -> List[PlannedSegment]:
+    """Сегменты с той же категорией и тем же названием — в один ролик; порядок по первому появлению."""
+    joined: dict = {}
+    for seg in segments:
+        if seg.key in joined:
+            target = joined[seg.key]
+            target.ranges = target.spans + [(seg.start, seg.end)]
+            target.end = seg.end
+        else:
+            joined[seg.key] = PlannedSegment(seg.start, seg.end, seg.category, stream_title=seg.stream_title)
+    return list(joined.values())
+
+
+def _cut_spans(spans: List[Tuple[int, int]], cuts: List[int]) -> List[List[Tuple[int, int]]]:
+    """Делит склеенные отрезки по позициям внутри ролика (секунды от его начала)."""
+    pieces: List[List[Tuple[int, int]]] = [[]]
+    position = 0
+    targets = iter(cuts)
+    cut = next(targets, None)
+    for start, end in spans:
+        while cut is not None and position < cut < position + (end - start):
+            middle = start + (cut - position)
+            pieces[-1].append((start, middle))
+            pieces.append([])
+            position, start = cut, middle
+            cut = next(targets, None)
+        pieces[-1].append((start, end))
+        position += end - start
+        if cut is not None and position == cut:
+            pieces.append([])
+            cut = next(targets, None)
+    return [piece for piece in pieces if piece]
 
 
 # --- что загружать ---
@@ -161,6 +251,20 @@ def skip_reason(
             if _fold(keyword) and _fold(keyword) in title:
                 return f"похоже на просмотр сериала или фильма: в названии стрима «{keyword}»"
     return None
+
+
+SHORT_PREFIX = "короче "
+
+
+def short_reason(duration_sec: float, min_minutes: int) -> Optional[str]:
+    """Сегменты короче min_minutes не загружаются: это заставки, перерывы и переходы."""
+    if min_minutes > 0 and duration_sec < min_minutes * 60:
+        return f"{SHORT_PREFIX}{min_minutes} мин"
+    return None
+
+
+def is_short_reason(reason: Optional[str]) -> bool:
+    return bool(reason) and reason.startswith(SHORT_PREFIX)
 
 
 def category_warnings(category: str, warn_categories: Iterable[str]) -> List[str]:
@@ -208,17 +312,21 @@ def build_description(
     streamer_login: str,
     stream_date: str,
     category: str,
-    start: str,
-    end: str,
+    spans: Iterable[Tuple[float, float]],
 ) -> str:
-    """Описание с указанием автора: этого требует разрешение стримера и правила YouTube."""
+    """Описание с указанием автора: этого требует разрешение стримера и правила YouTube.
+
+    spans — отрезки стрима в секундах; у склеенного ролика их несколько.
+    """
     lines = []
     title = clean_line(stream_title)[:1000]
     if title:
         lines += [title, ""]
     when = f" от {stream_date}" if stream_date else ""
+    spans = list(spans)
+    kind = "Фрагменты" if len(spans) > 1 else "Фрагмент"
     lines += [
-        f"Фрагмент стрима {clean_line(streamer)}{when}: {clean_line(category)}, {start}–{end}.",
+        f"{kind} стрима {clean_line(streamer)}{when}: {clean_line(category)}, {fmt_spans(spans)}.",
         f"Twitch: https://www.twitch.tv/{_LOGIN.sub('', streamer_login)}",
         "",
         "Опубликовано с разрешения автора.",
@@ -257,6 +365,11 @@ def fmt_hms(seconds: float) -> str:
     hours, rest = divmod(int(round(seconds)), 3600)
     minutes, secs = divmod(rest, 60)
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+def fmt_spans(spans: Iterable[Tuple[float, float]]) -> str:
+    """[(0, 2403), (17917, 27310)] → «0:00–40:03, 4:58:37–7:35:10»."""
+    return ", ".join(f"{fmt_hms(start)}–{fmt_hms(end)}" for start, end in spans)
 
 
 def fmt_duration(seconds: float) -> str:

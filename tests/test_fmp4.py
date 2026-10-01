@@ -7,6 +7,7 @@ from app.fmp4 import (
     base_time,
     boxes,
     first_times,
+    fragment_end_times,
     parse_playlist,
     rebase,
     select_parts,
@@ -35,14 +36,20 @@ def init_segment() -> bytes:
     return box(b"ftyp", b"isom" + bytes(4)) + box(b"moov", full(b"mvhd", 0, bytes(96)) + traks)
 
 
-def fragment(times: dict, *, emsg: bool = True) -> bytes:
-    """Как у Twitch: emsg с ID3, затем moof+mdat; звук с 32-битным tfdt, видео с 64-битным."""
+def fragment(times: dict, *, emsg: bool = True, durations: dict = None) -> bytes:
+    """Как у Twitch: emsg с ID3, затем moof+mdat; звук с 32-битным tfdt, видео с 64-битным.
+
+    durations — длительности сэмплов по дорожкам (trun с флагом 0x100).
+    """
     trafs = b""
     for track, value in times.items():
         version = 1 if track == VIDEO else 0
         tfdt = full(b"tfdt", version, struct.pack(">Q" if version else ">I", value))
         tfhd = full(b"tfhd", 0, struct.pack(">I", track))
-        trafs += box(b"traf", tfhd + tfdt + full(b"trun", 0, struct.pack(">I", 0)))
+        samples = (durations or {}).get(track, [])
+        trun = box(b"trun", bytes([0, 0, 0x03, 0x01]) + struct.pack(">Ii", len(samples), 0)
+                   + b"".join(struct.pack(">II", d, 100) for d in samples))
+        trafs += box(b"traf", tfhd + tfdt + trun)
     moof = box(b"moof", full(b"mfhd", 0, struct.pack(">I", 1)) + trafs)
     return (full(b"emsg", 0, b"urn:twitch:id3\0") if emsg else b"") + moof + box(b"mdat", b"x" * 64)
 
@@ -145,6 +152,40 @@ class RebaseTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             rebase(data, {AUDIO: 0, VIDEO: 0})
 
+
+
+class JoinTest(unittest.TestCase):
+    def test_fragment_end_times(self):
+        data = fragment({AUDIO: 1000, VIDEO: 5000}, durations={AUDIO: [1024, 1024], VIDEO: [16666, 16667, 16667]})
+        self.assertEqual(fragment_end_times(data), {AUDIO: 3048, VIDEO: 55000})
+
+    def test_end_without_sample_durations_is_an_error(self):
+        data = bytearray(fragment({AUDIO: 1000}))
+        data[data.index(b"trun") + 6] = 0x00  # флаги 0x000001: длительностей нет, а в tfhd нет значения по умолчанию
+        with self.assertRaises(ValueError):
+            fragment_end_times(bytes(data))
+
+    def test_second_fragment_continues_the_first(self):
+        # Первый отрезок: 4:00:00–4:00:10, второй — с 6:00:00; во втором ролике он должен начаться с 0:00:10
+        first = shifts(Fraction(14400), TIMESCALES)
+        second = shifts(Fraction(21600), TIMESCALES, offset=Fraction(10))
+        a = bytearray(fragment({AUDIO: 14400 * 48000, VIDEO: 14400 * 10**6}))
+        b = bytearray(fragment({AUDIO: 21600 * 48000, VIDEO: 21600 * 10**6}))
+        rebase(a, first)
+        rebase(b, second)
+        self.assertEqual(tfdts(bytes(a)), {AUDIO: 0, VIDEO: 0})
+        self.assertEqual(tfdts(bytes(b)), {AUDIO: 10 * 48000, VIDEO: 10 * 10**6})
+
+    def test_offset_is_rounded_up_so_fragments_never_overlap(self):
+        shift = shifts(Fraction(100), {AUDIO: 48000}, offset=Fraction(1, 3))
+        self.assertEqual(shift[AUDIO], 100 * 48000 - 16000)
+        shift = shifts(Fraction(100), {AUDIO: 48000}, offset=Fraction(1, 7))
+        self.assertEqual(shift[AUDIO], 100 * 48000 - 6858)  # 6857,14 тика округлены вверх
+
+    def test_audio_time_must_fit_32_bits(self):
+        data = bytearray(fragment({AUDIO: 10}))
+        with self.assertRaises(ValueError):
+            rebase(data, {AUDIO: -(2**32)})
 
 if __name__ == "__main__":
     unittest.main()

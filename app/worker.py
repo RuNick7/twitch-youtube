@@ -11,7 +11,7 @@ from html import escape
 from sqlalchemy import select, update
 
 from .context import App
-from .db import Segment, Status, Streamer, Vod, kv_get, kv_set, utcnow
+from .db import Segment, Status, Streamer, Vod, get_spans, kv_get, kv_set, utcnow
 from .hls import Plan, SourceError, build_plan, stream
 from .service import build_metadata, update_segment
 from .tools import fetch_vod_info
@@ -127,7 +127,7 @@ class Worker:
     async def _plan(self, seg: Segment, vod: Vod) -> Plan:
         if vod.playlist_url:
             try:
-                return await build_plan(self.app.http, vod.playlist_url, seg.start, seg.end)
+                return await build_plan(self.app.http, vod.playlist_url, get_spans(seg))
             except SourceError as exc:
                 log.info("Плейлист VOD %s не открылся (%s), беру свежую ссылку", vod.id, exc)
         info = await fetch_vod_info(vod.id)
@@ -135,7 +135,7 @@ class Worker:
             raise SourceError("yt-dlp не нашёл плейлист VOD")
         async with self.app.sessions() as session, session.begin():
             await session.execute(update(Vod).where(Vod.id == vod.id).values(playlist_url=info.playlist_url))
-        return await build_plan(self.app.http, info.playlist_url, seg.start, seg.end)
+        return await build_plan(self.app.http, info.playlist_url, get_spans(seg))
 
     async def _upload(self, seg: Segment, vod: Vod, streamer: Streamer, refresh_token: str, plan: Plan) -> str:
         app = self.app

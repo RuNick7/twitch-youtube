@@ -117,7 +117,7 @@ class Checker:
         if seg.status == Status.WAITING:
             warnings = get_warnings(seg) + youtube_warnings(item, seg.expected_duration)
             if seg.force_review:
-                warnings.append("загружен вручную, хотя фильтр сериалов и фильмов его пропустил")
+                warnings.append(f"загружен вручную, хотя фильтр его пропустил: {seg.reason or 'причина не сохранилась'}")
             if not warnings and not app.settings.auto_publish:
                 warnings.append("автопубликация выключена (AUTO_PUBLISH=false)")
             if warnings:

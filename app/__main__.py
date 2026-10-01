@@ -19,7 +19,7 @@ from .context import App
 from .crypto import Vault
 from .db import get_streamer, init_db, make_engine
 from .tools import update_ytdlp, ytdlp_version
-from .watcher import Watcher
+from .watcher import TitleTracker, Watcher
 from .worker import Worker
 from .youtube import YouTubeClient
 
@@ -76,6 +76,8 @@ async def main() -> None:
             app.spawn(Watcher(app).run())
         else:
             app.watch_state = "слежение выключено (WATCH_INTERVAL_SEC=0), только /process"
+        if settings.title_poll_sec > 0:
+            app.spawn(TitleTracker(app).run())
         app.spawn(keep_ytdlp_fresh(app))
         if app.owner_id is None:
             log.warning("TELEGRAM_OWNER_ID не задан: напишите боту /start, чтобы узнать свой ID")

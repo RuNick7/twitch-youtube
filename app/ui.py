@@ -9,8 +9,8 @@ from zoneinfo import ZoneInfo
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from .db import Segment, Status, Streamer, Vod, as_utc, get_warnings
-from .segments import fmt_duration, fmt_hms, twitch_time_param
+from .db import Segment, Status, Streamer, Vod, as_utc, get_spans, get_warnings
+from .segments import fmt_duration, fmt_spans, twitch_time_param
 
 PUBLISH, KEEP, RETRY, FORCE = "pub", "keep", "rt", "force"
 
@@ -94,10 +94,12 @@ def render_segment(
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     part = f" (часть {seg.part})" if seg.part else ""
     date = local_time(vod.started_at, tz)
-    stream = f"Стрим {date} «{escape(vod.title)}»" if date else f"Стрим «{escape(vod.title)}»"
+    name = escape(seg.stream_title or vod.title)
+    stream = f"Стрим {date} «{name}»" if date else f"Стрим «{name}»"
+    spans = get_spans(seg)
     lines = [
-        f"🎮 <b>{escape(seg.category)}</b>{part} · {fmt_hms(seg.start)}–{fmt_hms(seg.end)}"
-        f" ({fmt_duration(seg.end - seg.start)})",
+        f"🎮 <b>{escape(seg.category)}</b>{part} · {fmt_spans(spans)}"
+        f" ({fmt_duration(sum(end - start for start, end in spans))})",
         stream,
         f"Название: {escape(seg.title)}",
         "",

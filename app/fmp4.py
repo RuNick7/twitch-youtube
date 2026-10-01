@@ -12,7 +12,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 from fractions import Fraction
-from math import floor
+from math import ceil, floor
 from typing import Dict, Iterator, List, Optional, Tuple
 from urllib.parse import urljoin
 
@@ -27,6 +27,7 @@ class Part:
     start: float  # секунды от начала VOD
     duration: float
     size: int = 0
+    group: int = 0  # номер отрезка VOD, если ролик склеен из нескольких
 
 
 @dataclass
@@ -145,13 +146,58 @@ def first_times(fragment: bytes) -> Dict[int, int]:
     return found
 
 
+def fragment_end_times(fragment: bytes) -> Dict[int, int]:
+    """Конец фрагмента по дорожкам: tfdt плюс длительности всех сэмплов.
+
+    Нужен, чтобы приставить следующий отрезок VOD точно встык, без пропуска и наложения.
+    """
+    ends: Dict[int, int] = {}
+    for moof in (box for box in boxes(fragment) if box[0] == b"moof"):
+        for traf in _child(fragment, moof, b"traf"):
+            track = start = None
+            default_duration = None
+            total = 0
+            for kind, pos, header, size in boxes(fragment, traf[1] + traf[2], traf[1] + traf[3]):
+                body = pos + header
+                if kind == b"tfhd":
+                    flags = int.from_bytes(fragment[body + 1:body + 4], "big")
+                    track = struct.unpack_from(">I", fragment, body + 4)[0]
+                    field = body + 8 + (8 if flags & 0x1 else 0) + (4 if flags & 0x2 else 0)
+                    if flags & 0x8:
+                        default_duration = struct.unpack_from(">I", fragment, field)[0]
+                elif kind == b"tfdt":
+                    position, fmt = _full_box_field(fragment, (kind, pos, header, size), 4, 4, True)
+                    start = struct.unpack_from(fmt, fragment, position)[0]
+                elif kind == b"trun":
+                    flags = int.from_bytes(fragment[body + 1:body + 4], "big")
+                    count = struct.unpack_from(">I", fragment, body + 4)[0]
+                    field = body + 8 + (4 if flags & 0x1 else 0) + (4 if flags & 0x4 else 0)
+                    if flags & 0x100:
+                        step = 4 * sum(1 for bit in (0x100, 0x200, 0x400, 0x800) if flags & bit)
+                        total += sum(struct.unpack_from(">I", fragment, field + i * step)[0] for i in range(count))
+                    elif default_duration is not None:
+                        total += count * default_duration
+                    else:
+                        raise ValueError(f"у дорожки {track} нет длительностей сэмплов")
+            if track is None or start is None:
+                raise ValueError("traf без tfhd или tfdt")
+            ends[track] = max(ends.get(track, 0), start + total)
+    if not ends:
+        raise ValueError("во фрагменте нет moof")
+    return ends
+
+
 def base_time(first: Dict[int, int], timescales: Dict[int, int]) -> Fraction:
     """Новый ноль в секундах: самое раннее начало среди дорожек, чтобы не сбить синхронизацию."""
     return min(Fraction(value, timescales[track]) for track, value in first.items())
 
 
-def shifts(base: Fraction, timescales: Dict[int, int]) -> Dict[int, int]:
-    return {track: floor(base * timescale) for track, timescale in timescales.items()}
+def shifts(base: Fraction, timescales: Dict[int, int], offset: Fraction = Fraction(0)) -> Dict[int, int]:
+    """На сколько уменьшить tfdt каждой дорожки, чтобы время base стало временем offset в ролике.
+
+    offset округляется вверх: склеенные отрезки могут разойтись на долю кадра, но не налезть друг на друга.
+    """
+    return {track: floor(base * timescale) - ceil(offset * timescale) for track, timescale in timescales.items()}
 
 
 def rebase(fragment: bytearray, shift: Dict[int, int]) -> None:
@@ -166,4 +212,6 @@ def rebase(fragment: bytearray, shift: Dict[int, int]) -> None:
         value = struct.unpack_from(fmt, fragment, pos)[0] - shift[track]
         if value < 0:
             raise ValueError(f"время дорожки {track} уходит в минус")
+        if fmt == ">I" and value >= 2**32:
+            raise ValueError(f"время дорожки {track} не помещается в 32-битный tfdt")
         struct.pack_into(fmt, fragment, pos, value)
