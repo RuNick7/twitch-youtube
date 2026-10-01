@@ -44,8 +44,16 @@ class Settings(BaseSettings):
     # Слежение за каналом: как часто проверять и сколько ждать после конца стрима
     watch_interval_sec: int = 300
     watch_grace_min: int = 10
+    # Как часто во время стрима запрашивать его название: смена названия — граница сегмента
+    title_poll_sec: int = 60
 
+    # Короче min_segment_sec — приклеить к соседнему, короче skip_shorter_min — не загружать
     min_segment_sec: int = 120
+    skip_shorter_min: int = 7
+    # Куски одного стрима с той же категорией и тем же названием — один ролик
+    join_repeated: bool = True
+    # Категории, у которых в названии ролика не пишется «часть N»
+    no_part_categories: str = "Just Chatting,Minecraft"
 
     # Не загружать: сегменты этих категорий, если в названии стрима есть одно из слов
     # (так на стримах смотрят сериалы и фильмы), и категории из skip_categories всегда
@@ -77,3 +85,7 @@ class Settings(BaseSettings):
     @property
     def warned_categories(self) -> List[str]:
         return split_list(self.warn_categories)
+
+    @property
+    def unnumbered_categories(self) -> List[str]:
+        return split_list(self.no_part_categories)

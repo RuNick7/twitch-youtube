@@ -8,16 +8,29 @@ from html import escape
 from sqlalchemy import func, select, update
 
 from .context import App
-from .db import Segment, Status, Streamer, Vod, dump_warnings, get_streamer, utcnow
+from .db import (
+    Segment,
+    Status,
+    Streamer,
+    TitleChange,
+    Vod,
+    as_utc,
+    dump_spans,
+    dump_warnings,
+    get_spans,
+    get_streamer,
+    utcnow,
+)
 from .segments import (
     build_description,
     build_tags,
     build_title,
     category_warnings,
-    fmt_hms,
     normalize_chapters,
     plan_segments,
+    short_reason,
     skip_reason,
+    split_by_titles,
 )
 from .tools import VodInfo
 from .ui import local_time, render_segment, render_vod_header, youtube_link
@@ -43,7 +56,13 @@ async def ingest_vod(app: App, info: VodInfo) -> int:
     if info.uploader_login and info.uploader_login != settings.twitch_channel.lower():
         raise IngestError(f"VOD с канала {info.uploader_login}, а в настройках указан {settings.twitch_channel}")
 
-    planned = plan_segments(normalize_chapters(info.chapters, info.duration), min_sec=settings.min_segment_sec)
+    chapters = split_by_titles(normalize_chapters(info.chapters, info.duration), await title_marks(app, info))
+    planned = plan_segments(
+        chapters,
+        min_sec=settings.min_segment_sec,
+        no_part=settings.unnumbered_categories,
+        join=settings.join_repeated,
+    )
     now = utcnow()
 
     async with app.sessions() as session, session.begin():
@@ -67,13 +86,14 @@ async def ingest_vod(app: App, info: VodInfo) -> int:
         await session.flush()
         segments = []
         for i, p in enumerate(planned, 1):
+            stream_title = p.stream_title or info.title
             reason = skip_reason(
                 p.category,
-                info.title,
+                stream_title,
                 keywords=settings.keywords,
                 title_categories=settings.title_categories,
                 categories=settings.skipped_categories,
-            )
+            ) or short_reason(p.duration, settings.skip_shorter_min)
             segments.append(
                 Segment(
                     vod_id=info.id,
@@ -82,7 +102,9 @@ async def ingest_vod(app: App, info: VodInfo) -> int:
                     end=p.end,
                     category=p.category,
                     part=p.part,
-                    title=build_title(p.category, info.title, name, p.part),
+                    title=build_title(p.category, stream_title, name, p.part),
+                    stream_title=stream_title,
+                    ranges=dump_spans(p.spans),
                     status=Status.SKIPPED if reason else Status.QUEUED,
                     reason=reason,
                     warnings=dump_warnings(category_warnings(p.category, settings.warned_categories)),
@@ -99,6 +121,38 @@ async def ingest_vod(app: App, info: VodInfo) -> int:
             await update_segment(app, seg.id, tg_message_id=message.message_id)
     app.wake.set()
     return len(segments)
+
+
+async def title_marks(app: App, info: VodInfo) -> list[tuple[float, str]]:
+    """Смены названия этого стрима, замеченные во время эфира: (секунда от начала VOD, название).
+
+    Стрим узнаётся по времени начала: VOD и стрим начинаются одновременно.
+    """
+    if info.started_at is None:
+        return []
+    window = timedelta(minutes=15)
+    async with app.sessions() as session:
+        rows = list(
+            (
+                await session.scalars(
+                    select(TitleChange)
+                    .where(
+                        TitleChange.channel == app.settings.twitch_channel.lower(),
+                        TitleChange.stream_started_at >= info.started_at - window,
+                        TitleChange.stream_started_at <= info.started_at + window,
+                    )
+                    .order_by(TitleChange.at)
+                )
+            ).all()
+        )
+    if not rows:
+        return []
+    closest = min(rows, key=lambda row: abs(as_utc(row.stream_started_at) - info.started_at))
+    return [
+        ((as_utc(row.at) - info.started_at).total_seconds(), row.title)
+        for row in rows
+        if row.stream_id == closest.stream_id
+    ]
 
 
 async def update_segment(app: App, segment_id: int, **values) -> None:
@@ -132,13 +186,12 @@ def build_metadata(app: App, seg: Segment, vod: Vod, streamer: Streamer) -> dict
     snippet = {
         "title": seg.title,
         "description": build_description(
-            vod.title,
+            seg.stream_title or vod.title,
             name,
             streamer.login,
             local_time(vod.started_at, app.tz, "%d.%m.%Y"),
             seg.category,
-            fmt_hms(seg.start),
-            fmt_hms(seg.end),
+            get_spans(seg),
         ),
         "tags": build_tags(seg.category, name, streamer.login, "стрим", "twitch"),
         "categoryId": settings.youtube_category_id,

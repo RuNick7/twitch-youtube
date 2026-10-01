@@ -63,7 +63,8 @@ async def fetch_vod_info(vod_id: str) -> VodInfo:
     protocol = str(data.get("protocol") or "")
     return VodInfo(
         id=str(data.get("id") or vod_id).lstrip("v"),
-        title=data.get("title") or "",
+        # у идущего стрима yt-dlp дописывает к title дату, fulltitle — без неё
+        title=data.get("fulltitle") or data.get("title") or "",
         duration=int(data.get("duration") or 0),
         uploader=data.get("uploader") or data.get("uploader_id") or "",
         uploader_login=(data.get("uploader_id") or "").lower(),

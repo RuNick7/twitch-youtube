@@ -1,7 +1,8 @@
 """Слежение за каналом: после конца стрима VOD сам уходит в обработку.
 
 Ключи Twitch API не нужны: список записей эфиров и признак «идёт сейчас» берутся
-через yt-dlp — тот же источник, откуда берутся главы и плейлист.
+через yt-dlp — тот же источник, откуда берутся главы и плейлист. Название стрима
+во время эфира — лёгким запросом к GraphQL Twitch (см. twitch.py).
 """
 
 from __future__ import annotations
@@ -11,16 +12,20 @@ import logging
 from datetime import datetime, timedelta
 from html import escape
 
+from sqlalchemy import select
+
 from .context import App
-from .db import Vod, as_utc, kv_get, kv_set, utcnow
+from .db import TitleChange, Vod, as_utc, kv_get, kv_set, utcnow
 from .service import IngestError, ingest_vod
 from .tools import fetch_vod_info, list_channel_vods
+from .twitch import client_id, live_state
 from .ui import local_time
 
 log = logging.getLogger(__name__)
 
 SINCE_KEY = "watch_since"
 ALERT_AFTER_FAILURES = 3
+TITLE_ALERT_AFTER_FAILURES = 10
 
 
 class Watcher:
@@ -92,3 +97,61 @@ class Watcher:
             app.watch_state = f"стрим закончился, жду {app.settings.watch_grace_min} мин на случай переподключения"
         else:
             app.watch_state = f"стрима нет, проверено в {checked}"
+
+
+class TitleTracker:
+    """Пока идёт стрим, записывает смены его названия: в данных VOD их нет, а это граница сегмента."""
+
+    def __init__(self, app: App):
+        self.app = app
+        self.client: str | None = None
+        self.last: tuple[str, str] | None = None  # (ID стрима, название), уже записанные в базу
+        self.failures = 0
+
+    async def run(self) -> None:
+        while True:
+            try:
+                await self.tick()
+                self.failures = 0
+            except Exception as exc:
+                self.failures += 1
+                self.client = None  # вдруг Twitch сменил ID клиента: возьмём свежий у yt-dlp
+                log.warning("Не удалось узнать название стрима: %s", exc)
+                if self.failures == TITLE_ALERT_AFTER_FAILURES:
+                    await self.app.notify(
+                        f"🟡 Не получается узнать название стрима {TITLE_ALERT_AFTER_FAILURES} раз подряд: "
+                        f"{escape(str(exc)[:300])}. Пока это так, нарезка идёт только по категориям."
+                    )
+            await asyncio.sleep(self.app.settings.title_poll_sec)
+
+    async def tick(self) -> None:
+        if self.client is None:
+            self.client = await client_id()
+        channel = self.app.settings.twitch_channel.lower()
+        state = await live_state(self.app.http, channel, self.client)
+        if state is None:
+            self.last = None
+            self.app.live_title = None
+            return
+        self.app.live_title = state.title
+        if self.last == (state.stream_id, state.title):
+            return
+        async with self.app.sessions() as session, session.begin():
+            previous = await session.scalar(
+                select(TitleChange)
+                .where(TitleChange.channel == channel, TitleChange.stream_id == state.stream_id)
+                .order_by(TitleChange.at.desc())
+                .limit(1)
+            )
+            if previous is None or previous.title != state.title:
+                session.add(
+                    TitleChange(
+                        channel=channel,
+                        stream_id=state.stream_id,
+                        stream_started_at=state.started_at,
+                        at=utcnow(),
+                        title=state.title,
+                    )
+                )
+                log.info("Название стрима: %s", state.title)
+        self.last = (state.stream_id, state.title)

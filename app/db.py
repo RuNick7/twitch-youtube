@@ -72,6 +72,8 @@ class Segment(Base):
     category: Mapped[str] = mapped_column(String(256))
     part: Mapped[int | None]
     title: Mapped[str] = mapped_column(String(256))
+    stream_title: Mapped[str | None] = mapped_column(Text)  # название стрима на этом отрезке
+    ranges: Mapped[str | None] = mapped_column(Text)  # JSON [[start, end], …], если ролик склеен из отрезков
     status: Mapped[str] = mapped_column(String(16), default=Status.QUEUED, index=True)
     reason: Mapped[str | None] = mapped_column(Text)  # почему пропущен или отклонён
     warnings: Mapped[str | None] = mapped_column(Text)  # JSON-список предупреждений
@@ -90,11 +92,33 @@ class Segment(Base):
     tg_message_id: Mapped[int | None] = mapped_column(BigInteger)
 
 
+class TitleChange(Base):
+    """Название стрима, замеченное во время эфира. В данных VOD истории названий нет."""
+
+    __tablename__ = "title_changes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    channel: Mapped[str] = mapped_column(String(64), index=True)
+    stream_id: Mapped[str] = mapped_column(String(32))
+    stream_started_at: Mapped[datetime]
+    at: Mapped[datetime]  # когда бот увидел это название
+    title: Mapped[str] = mapped_column(Text)
+
+
 class KV(Base):
     __tablename__ = "kv"
 
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str] = mapped_column(Text)
+
+
+def get_spans(seg: Segment) -> list[tuple[int, int]]:
+    """Отрезки VOD, из которых состоит ролик сегмента."""
+    return [tuple(span) for span in json.loads(seg.ranges)] if seg.ranges else [(seg.start, seg.end)]
+
+
+def dump_spans(spans: list[tuple[int, int]]) -> str | None:
+    return json.dumps([list(span) for span in spans]) if len(spans) > 1 else None
 
 
 def get_warnings(seg: Segment) -> list[str]:
@@ -119,10 +143,26 @@ def make_engine(path: Path) -> AsyncEngine:
 
 
 async def init_db(engine: AsyncEngine) -> None:
-    # Пока схема не менялась на рабочем сервере, таблицы создаются напрямую;
-    # миграции Alembic появятся с первым изменением после запуска
+    """Создаёт недостающие таблицы и добавляет в существующие недостающие колонки.
+
+    Пока схема только растёт, этого достаточно; для переименований и удалений
+    понадобятся миграции Alembic.
+    """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_add_missing_columns)
+
+
+def _add_missing_columns(conn) -> None:
+    for table in Base.metadata.sorted_tables:
+        existing = {row[1] for row in conn.exec_driver_sql(f'PRAGMA table_info("{table.name}")')}
+        for column in table.columns:
+            if column.name in existing:
+                continue
+            if not column.nullable:
+                raise RuntimeError(f"нельзя автоматически добавить обязательную колонку {table.name}.{column.name}")
+            kind = column.type.compile(dialect=conn.dialect)
+            conn.exec_driver_sql(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {kind}')
 
 
 async def find_streamer(session: AsyncSession, login: str) -> Streamer | None:

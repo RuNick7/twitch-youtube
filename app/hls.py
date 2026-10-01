@@ -5,11 +5,22 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from dataclasses import dataclass, field
+from fractions import Fraction
 from typing import AsyncIterator, Dict, List, Optional, Tuple
 
 import httpx
 
-from .fmp4 import Part, base_time, first_times, parse_playlist, rebase, select_parts, shifts, timescales_from_init
+from .fmp4 import (
+    Part,
+    base_time,
+    first_times,
+    fragment_end_times,
+    parse_playlist,
+    rebase,
+    select_parts,
+    shifts,
+    timescales_from_init,
+)
 
 HEAD_CONCURRENCY = 16
 PREFETCH = 2  # фрагментов наперёд: пока отправляется один кусок, следующие уже качаются
@@ -25,7 +36,8 @@ class SourceError(RuntimeError):
 class Plan:
     parts: List[Part]
     init: bytes = b""
-    shift: Optional[Dict[int, int]] = field(default=None)  # None — MPEG-TS, время не сдвигается
+    # Сдвиг времени для каждого отрезка (Part.group); None — MPEG-TS, время не сдвигается
+    shifts: Optional[List[Dict[int, int]]] = field(default=None)
 
     @property
     def total(self) -> int:
@@ -58,14 +70,23 @@ async def _request(http: httpx.AsyncClient, url: str, method: str = "GET") -> ht
     raise SourceError(f"не удалось получить {_name(url)} с Twitch: {problem}")
 
 
-async def build_plan(http: httpx.AsyncClient, playlist_url: str, start: float, end: float) -> Plan:
-    """Фрагменты сегмента и их размеры; для fMP4 ещё init и сдвиг времени к нулю."""
+async def build_plan(http: httpx.AsyncClient, playlist_url: str, ranges: List[Tuple[float, float]]) -> Plan:
+    """Фрагменты ролика и их размеры; для fMP4 ещё init и сдвиги времени.
+
+    Ролик может быть склеен из нескольких отрезков VOD: время первого сдвигается к
+    нулю, каждого следующего — точно к концу предыдущего.
+    """
     playlist = parse_playlist((await _request(http, playlist_url)).text, playlist_url)
     if not playlist.ended:
         raise SourceError("VOD ещё дописывается: стрим не закончился")
-    parts = select_parts(playlist.parts, start, end)
-    if not parts:
+    groups = [group for group in (select_parts(playlist.parts, start, end) for start, end in ranges) if group]
+    if not groups:
         raise SourceError("в VOD нет фрагментов для этого отрезка")
+    parts: List[Part] = []
+    for index, group in enumerate(groups):
+        for part in group:
+            part.group = index
+            parts.append(part)
 
     limit = asyncio.Semaphore(HEAD_CONCURRENCY)
 
@@ -86,8 +107,14 @@ async def build_plan(http: httpx.AsyncClient, playlist_url: str, start: float, e
         plan.init = (await _request(http, playlist.init_url)).content
         try:
             timescales = timescales_from_init(plan.init)
-            first = first_times((await _request(http, parts[0].url)).content)
-            plan.shift = shifts(base_time(first, timescales), timescales)
+            plan.shifts = []
+            offset = Fraction(0)  # где в ролике начинается очередной отрезок, секунды
+            for index, group in enumerate(groups):
+                base = base_time(first_times((await _request(http, group[0].url)).content), timescales)
+                plan.shifts.append(shifts(base, timescales, offset))
+                if index + 1 < len(groups):
+                    ends = fragment_end_times((await _request(http, group[-1].url)).content)
+                    offset += max(Fraction(value, timescales[track]) for track, value in ends.items()) - base
         except (ValueError, KeyError) as exc:
             raise SourceError(f"не удалось разобрать MP4 из VOD: {exc}") from exc
     return plan
@@ -118,9 +145,9 @@ async def _fetch(http: httpx.AsyncClient, plan: Plan, part: Part) -> bytearray:
     data = await _download(http, part.url)
     if len(data) != part.size:
         raise SourceError(f"{_name(part.url)}: {len(data)} байт вместо {part.size}, VOD изменился")
-    if plan.shift is not None:
+    if plan.shifts is not None:
         try:
-            rebase(data, plan.shift)
+            rebase(data, plan.shifts[part.group])
         except ValueError as exc:
             raise SourceError(f"{_name(part.url)} повреждён: {exc}") from exc
     return data

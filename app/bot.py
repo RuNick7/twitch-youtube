@@ -13,7 +13,7 @@ from aiogram.types import CallbackQuery, Message
 
 from .context import App
 from .db import Segment, Status, Vod, find_streamer, get_streamer, utcnow
-from .segments import parse_vod_id
+from .segments import is_short_reason, parse_vod_id
 from .service import PUBLISHABLE, IngestError, ingest_vod, publish, set_status, status_counts
 from .tools import ToolError, fetch_vod_info
 from .ui import FORCE, KEEP, PUBLISH, RETRY, SegmentAction
@@ -151,6 +151,7 @@ async def show_status(message: Message, app: App) -> None:
         "\n".join(
             [
                 f"Twitch: {escape(app.settings.twitch_channel)} — {app.watch_state}",
+                *([f"Название стрима сейчас: «{escape(app.live_title)}»"] if app.live_title else []),
                 f"YouTube: {youtube}",
                 f"Обработка: {'⏸ на паузе, /resume — продолжить' if paused else '▶️ работает'}",
                 f"Автопубликация: {'через ' + str(app.settings.publish_delay_min) + ' мин после обработки' if app.settings.auto_publish else 'выключена'}",
@@ -213,10 +214,15 @@ async def retry(query: CallbackQuery, callback_data: SegmentAction, app: App) ->
 
 @owner.callback_query(SegmentAction.filter(F.action == FORCE))
 async def force_upload(query: CallbackQuery, callback_data: SegmentAction, app: App) -> None:
+    async with app.sessions() as session:
+        seg = await session.get(Segment, callback_data.id)
+    # Короткий сегмент не опасен и публикуется как обычно, а пропущенный фильтром сериалов — только по решению
+    review = not (seg and is_short_reason(seg.reason))
     changed = await set_status(
-        app, callback_data.id, (Status.SKIPPED,), Status.QUEUED, queued_at=utcnow(), force_review=True
+        app, callback_data.id, (Status.SKIPPED,), Status.QUEUED, queued_at=utcnow(), force_review=review
     )
-    await query.answer("Загружу, но публиковать только после вашего решения" if changed else "Уже обработан")
+    answer = "Загружу, но опубликую только после вашего решения" if review else "Загружу"
+    await query.answer(answer if changed else "Уже обработан")
     await app.refresh_segment(callback_data.id)
     if changed:
         app.wake.set()

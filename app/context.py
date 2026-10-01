@@ -35,6 +35,7 @@ class App:
     wake: asyncio.Event = field(default_factory=asyncio.Event)  # будит очередь загрузки
     ytdlp_version: str = "?"
     watch_state: str = "ещё не проверялся"  # для /status
+    live_title: str | None = None  # название идущего стрима, если он идёт
     tasks: set[asyncio.Task] = field(default_factory=set)
 
     @property

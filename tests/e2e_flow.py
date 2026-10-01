@@ -46,6 +46,8 @@ os.environ.update(
     WATCH_INTERVAL_SEC="2",
     WATCH_GRACE_MIN="0",
     MONITOR_DAYS="1",
+    TITLE_POLL_SEC="1",
+    SKIP_SHORTER_MIN="4",
 )
 
 import app.__main__ as entry  # noqa: E402
@@ -61,8 +63,9 @@ from aiogram.client.session.base import BaseSession  # noqa: E402
 from sqlalchemy import select, update  # noqa: E402
 from sqlalchemy.ext.asyncio import async_sessionmaker  # noqa: E402
 
-from app.db import Segment, Status, Vod, get_warnings, make_engine  # noqa: E402
+from app.db import Segment, Status, TitleChange, Vod, get_spans, get_warnings, make_engine  # noqa: E402
 from app.tools import VodInfo, fetch_vod_info  # noqa: E402
+from app.twitch import LiveState  # noqa: E402
 
 yt.DEVICE_CODE_URL = f"{BASE}/device/code"
 yt.TOKEN_URL = f"{BASE}/token"
@@ -415,12 +418,17 @@ class FakeGoogle:
 
 
 class FakeChannel:
+    """Подставной Twitch для слежения: список VOD, данные VOD и название идущего стрима."""
+
     def __init__(self, watch_info: VodInfo, old_info: VodInfo):
         self.enabled = False
         self.live = True
         self.watch_info = watch_info
         self.old_info = old_info
         self.list_calls = 0
+        self.title_calls = 0
+        self.title = watch_info.title
+        self.started = datetime.now(timezone.utc) - timedelta(seconds=60)
 
     async def list_vods(self, channel, limit=5):
         if channel != "zakvielchannel":
@@ -433,12 +441,21 @@ class FakeChannel:
             return self.old_info
         info = VodInfo(**{**self.watch_info.__dict__})
         info.is_live = self.live
+        info.started_at = self.started
         if self.live:
-            info.started_at = datetime.now(timezone.utc) - timedelta(seconds=100)
-            info.duration = 100
-        else:
-            info.started_at = datetime.now(timezone.utc) - timedelta(seconds=info.duration + 1)
+            info.duration = int((datetime.now(timezone.utc) - self.started).total_seconds())
         return info
+
+    async def client_id(self):
+        return "test-client"
+
+    async def live_state(self, http, channel, client):
+        if channel != "zakvielchannel" or client != "test-client":
+            raise AssertionError((channel, client))
+        self.title_calls += 1
+        if not (self.enabled and self.live):
+            return None
+        return LiveState(stream_id="stream-w", started_at=self.started, title=self.title)
 
 
 # ---------- приложение ----------
@@ -472,12 +489,12 @@ async def main():
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", PORT).start()
 
-    # Настоящие данные VOD для слежения, но короткие: 2 главы по 2 минуты
+    # Настоящие видео VOD для слежения, но короткий эфир: Minecraft 8 минут и Just Chatting 7 минут
     real = await fetch_vod_info(VOD_WATCH)
-    watch_info = VodInfo(id=VOD_WATCH, title="Майнкрафт Лайв в 20:00", duration=240, uploader=real.uploader,
+    watch_info = VodInfo(id=VOD_WATCH, title="Майнкрафт Лайв в 20:00", duration=900, uploader=real.uploader,
                          uploader_login=real.uploader_login, started_at=None, is_live=True,
-                         chapters=[{"start_time": 0, "end_time": 120, "title": "Minecraft"},
-                                   {"start_time": 120, "end_time": 240, "title": "Just Chatting"}],
+                         chapters=[{"start_time": 0, "end_time": 480, "title": "Minecraft"},
+                                   {"start_time": 480, "end_time": 900, "title": "Just Chatting"}],
                          playlist_url=real.playlist_url)
     old_info = VodInfo(id=VOD_OLD, title="старый стрим", duration=3600, uploader=real.uploader,
                        uploader_login=real.uploader_login, started_at=datetime(2026, 9, 21, tzinfo=timezone.utc),
@@ -485,6 +502,8 @@ async def main():
     channel = FakeChannel(watch_info, old_info)
     watcher_mod.list_channel_vods = channel.list_vods
     watcher_mod.fetch_vod_info = channel.info
+    watcher_mod.live_state = channel.live_state
+    watcher_mod.client_id = channel.client_id
 
     tg = FakeTelegram()
     entry.Bot = functools.partial(Bot, session=tg)
@@ -552,16 +571,19 @@ async def main():
     reply = await say("/pause")
     check("остановлены" in reply[-1][1]["text"], "/pause")
 
-    print("\n== 2. Стрим с сериалом: Just Chatting пропускается, игра идёт в очередь", flush=True)
+    print("\n== 2. Стрим с сериалом: оба Just Chatting склеены в один ролик и пропущены, игра в очереди", flush=True)
     since = tg.next_message_id
     tg.push_text(OWNER, f"/process https://www.twitch.tv/videos/{VOD_SERIES}")
     s_rows = await wait_for(lambda: all_sent(VOD_SERIES), 120, "сегменты S")
-    check([r.status for r in s_rows] == [Status.SKIPPED, Status.QUEUED, Status.SKIPPED],
-          "JC пропущены, Minecraft в очереди", [(r.category, r.status) for r in s_rows])
-    header = tg.find("не загружаются: 2", since)
-    check(header is not None, "в карточке стрима видно, что 2 сегмента не загружаются")
-    s_jc1, s_mc, s_jc2 = s_rows
-    m = tg.messages[s_jc1.tg_message_id]
+    check([(r.category, r.status) for r in s_rows] == [("Just Chatting", Status.SKIPPED), ("Minecraft", Status.QUEUED)],
+          "два Just Chatting стали одним сегментом и пропущены, Minecraft в очереди", [(r.category, r.status) for r in s_rows])
+    header = tg.find("не загружаются: 1", since)
+    check(header is not None, "в карточке стрима видно, что сегмент не загружается")
+    s_jc, s_mc = s_rows
+    check(len(get_spans(s_jc)) == 2 and s_jc.part is None, "склеенный сегмент состоит из двух отрезков, без «часть N»",
+          get_spans(s_jc))
+    m = tg.messages[s_jc.tg_message_id]
+    check(", " in m["text"].splitlines()[0], "в сообщении видны оба отрезка", m["text"].splitlines()[0])
     check("⏭ Не загружен: похоже на просмотр сериала" in m["text"] and "⬆️ Всё равно загрузить" in buttons(m["markup"]),
           "пропущенный сегмент: причина и кнопка «Всё равно загрузить»", m["text"][-120:])
     check(all(tg.messages[r.tg_message_id]["silent"] for r in s_rows) and tg.messages[header]["silent"],
@@ -578,19 +600,21 @@ async def main():
     check(vod_n.playlist_url and vod_n.playlist_url.endswith("index-dvr.m3u8"), "плейлист VOD сохранён")
 
     # Короткие отрезки вместо многочасовых, чтобы тест шёл минуты
-    ranges = {s_mc.id: (1200, 1290), n_jc.id: (600, 690), n_mc.id: (3000, 3120), s_jc2.id: (6000, 6060)}
+    ranges = {s_mc.id: (1200, 1290), n_jc.id: (600, 690), n_mc.id: (3000, 3120)}
     async with db() as s, s.begin():
         for sid, (a, b) in ranges.items():
             await s.execute(update(Segment).where(Segment.id == sid).values(start=a, end=b))
+        # склеенный ролик: по 30 секунд из начала стрима и из пятого часа
+        await s.execute(update(Segment).where(Segment.id == s_jc.id).values(start=100, end=18030, ranges="[[100, 130], [18000, 18030]]"))
     google.behaviours = {"Minecraft — ВО ВСЕ": "rejected", "Just Chatting — ФРИКЛЕНД": "monitor_block",
-                         "Minecraft — ФРИКЛЕНД": "blocked", "Just Chatting (часть 2)": "clean",
-                         "Minecraft — Майнкрафт": "locked", "Just Chatting — Майнкрафт": "clean"}
+                         "Minecraft — ФРИКЛЕНД": "blocked", "Just Chatting — ВО ВСЕ": "clean",
+                         "Minecraft — Майнкрафт: строим": "locked", "Just Chatting — Майнкрафт: строим": "clean"}
     google.fail_plans = {"Minecraft — ФРИКЛЕНД": {1: "503", 3: "drop_half"}}
     google.crash = {"Minecraft — ФРИКЛЕНД": 5}
 
     print("\n== 4. «Всё равно загрузить» для пропущенного", flush=True)
-    answer = await press(s_jc2.tg_message_id, "⬆️")
-    row = await seg(s_jc2.id)
+    answer = await press(s_jc.tg_message_id, "⬆️")
+    row = await seg(s_jc.id)
     check(row.status == Status.QUEUED and row.force_review, "сегмент в очереди с пометкой «решать вручную»", answer)
 
     print("\n== 5. /resume: загрузка потоком, сбои сети, перезапуск посреди ролика", flush=True)
@@ -627,7 +651,7 @@ async def main():
     check(buttons(tg.messages[n_mc.tg_message_id]["markup"])[:2] == ["✅ Опубликовать", "🔒 Оставить приватным"],
           "под сегментом кнопки решения")
 
-    row = await wait_for(lambda: status_in(s_jc2.id, finals), 300, "S.JC2")
+    row = await wait_for(lambda: status_in(s_jc.id, finals), 300, "S.JC")
     check(row.status == Status.REVIEW and any("вручную" in w for w in get_warnings(row)),
           "загруженный вручную сегмент тоже ждёт решения", get_warnings(row))
 
@@ -635,10 +659,10 @@ async def main():
     answer = await press(n_mc.tg_message_id, "✅")
     row = await wait_for(lambda: status_in(n_mc.id, (Status.PUBLISHED,)), 30, "публикация N.MC")
     check(answer == "Публикую…" and row.status == Status.PUBLISHED, "«Опубликовать» публикует ролик")
-    answer = await press(s_jc2.tg_message_id, "🔒")
-    row = await seg(s_jc2.id)
+    answer = await press(s_jc.tg_message_id, "🔒")
+    row = await seg(s_jc.id)
     check(row.status == Status.PRIVATE and answer == "Оставлен приватным", "«Оставить приватным»")
-    check("✅ Всё-таки опубликовать" in buttons(tg.messages[s_jc2.tg_message_id]["markup"]), "передумать можно")
+    check("✅ Всё-таки опубликовать" in buttons(tg.messages[s_jc.tg_message_id]["markup"]), "передумать можно")
 
     print("\n== 8. Наблюдение после публикации", flush=True)
     alert = await wait_for(lambda: tg.find(f"🔴 С опубликованным роликом «{n_jc.title[:30]}"), 60, "тревога после публикации")
@@ -647,31 +671,73 @@ async def main():
     alerts = [mid for mid, m in tg.owner_messages() if m["text"].startswith(f"🔴 С опубликованным роликом «{n_jc.title[:30]}")]
     check(len(alerts) == 1, "о той же проблеме бот сообщает один раз", len(alerts))
 
-    print("\n== 9. Слежение за каналом", flush=True)
-    calls = channel.list_calls
+    print("\n== 9. Слежение за каналом и сменами названия", flush=True)
+    await say("/pause")
+    calls, title_calls = channel.list_calls, channel.title_calls
     channel.enabled = True
     await wait_for(lambda: channel.list_calls >= calls + 2, 30, "опрос канала")
+    await wait_for(lambda: channel.title_calls >= title_calls + 2, 30, "опрос названия")
+    titles = ["Майнкрафт Лайв в 20:00", "Майнкрафт: строим базу", "Смотрим Во все тяжкие"]
+    for title in titles[1:]:
+        before = channel.title_calls
+        channel.title = title
+        await wait_for(lambda: channel.title_calls >= before + 3, 30, f"название «{title}» замечено")
+    async with db() as s:
+        changes = list((await s.scalars(select(TitleChange).order_by(TitleChange.at))).all())
+    check([c.title for c in changes] == titles, "каждая смена названия записана один раз", [c.title for c in changes])
     reply = await say("/status")
-    check("идёт стрим" in reply[-1][1]["text"], "/status: идёт стрим", reply[-1][1]["text"])
+    text = reply[-1][1]["text"]
+    check("идёт стрим" in text and "Название стрима сейчас: «Смотрим Во все тяжкие»" in text,
+          "/status: идёт стрим и его текущее название", text)
     async with db() as s:
         check(await s.get(Vod, VOD_WATCH) is None and await s.get(Vod, VOD_OLD) is None,
               "пока стрим идёт, VOD не трогается; старый VOD игнорируется")
+    # В настоящем эфире названия сменились бы на 3:20 и 11:00: переносим записанные времена на эту шкалу
+    channel.started = datetime.now(timezone.utc) - timedelta(seconds=901)
+    async with db() as s, s.begin():
+        for change, offset in zip(changes, (20, 200, 660)):
+            await s.execute(update(TitleChange).where(TitleChange.id == change.id).values(
+                at=channel.started + timedelta(seconds=offset), stream_started_at=channel.started))
     channel.live = False
     w_rows = await wait_for(lambda: all_sent(VOD_WATCH), 60, "VOD после конца стрима")
-    check(len(w_rows) == 2 and not any(r.status == Status.SKIPPED for r in w_rows),
-          "после конца стрима VOD ушёл в обработку сам", [(r.category, r.status) for r in w_rows])
-    w_mc, w_jc = w_rows
+    got = [(r.category, r.stream_title, r.start, r.end, r.status) for r in w_rows]
+    check(got == [
+        ("Minecraft", titles[0], 0, 200, Status.SKIPPED),
+        ("Minecraft", titles[1], 200, 480, Status.QUEUED),
+        ("Just Chatting", titles[1], 480, 660, Status.SKIPPED),
+        ("Just Chatting", titles[2], 660, 900, Status.SKIPPED),
+    ], "VOD разрезан и по категориям, и по сменам названия", got)
+    reasons = [r.reason or "" for r in w_rows]
+    check(reasons[0] == reasons[2] == "короче 4 мин" and "во все тяжкие" in reasons[3],
+          "короткие куски и сериал не загружаются, каждый со своей причиной", reasons)
+    check([r.title for r in w_rows] == [
+        "Minecraft — Майнкрафт Лайв в 20:00 | ZakvielChannel",
+        "Minecraft — Майнкрафт: строим базу | ZakvielChannel",
+        "Just Chatting — Майнкрафт: строим базу | ZakvielChannel",
+        "Just Chatting — Смотрим Во все тяжкие | ZakvielChannel",
+    ], "у каждого ролика название его отрезка, без «часть N»", [r.title for r in w_rows])
+    w_mc, w_jc = w_rows[1], w_rows[2]
+    answer = await press(w_jc.tg_message_id, "⬆️")
+    row = await seg(w_jc.id)
+    check(row.status == Status.QUEUED and not row.force_review and answer == "Загружу",
+          "короткий кусок по кнопке загружается без лишнего решения", (row.status, row.force_review, answer))
+    async with db() as s, s.begin():
+        await s.execute(update(Segment).where(Segment.id == w_mc.id).values(end=w_mc.start + 60))
+        await s.execute(update(Segment).where(Segment.id == w_jc.id).values(end=w_jc.start + 60))
+    await say("/resume")
     row = await wait_for(lambda: status_in(w_mc.id, finals), 300, "W.MC")
     check(row.status == Status.LOCKED, "проект без аудита: YouTube не дал опубликовать → 🔒", (row.status, row.reason))
-    check(tg.find("🔒 «Minecraft — Майнкрафт") is not None, "пришло объяснение про аудит")
+    check(tg.find("🔒 «Minecraft — Майнкрафт: строим") is not None, "пришло объяснение про аудит")
     row = await wait_for(lambda: status_in(w_jc.id, finals), 300, "W.JC")
-    check(row.status == Status.PUBLISHED, "второй сегмент опубликован сам")
+    check(row.status == Status.PUBLISHED, "короткий кусок, загруженный по кнопке, опубликован сам", (row.status, get_warnings(row)))
+    meta = next(v["meta"] for v in google.sessions.values() if v["title"] == row.title)
+    check(meta["snippet"]["description"].startswith("Майнкрафт: строим базу"), "в описании название этого отрезка")
     async with db() as s:
         check(await s.get(Vod, VOD_OLD) is None, "VOD, закончившийся до начала слежения, так и не тронут")
 
     print("\n== 10. Файлы на «YouTube»", flush=True)
     by_title = {v["title"]: v for v in google.sessions.values() if v.get("video")}
-    for rid in (s_mc.id, n_jc.id, n_mc.id, s_jc2.id, w_mc.id, w_jc.id):
+    for rid in (s_mc.id, n_jc.id, n_mc.id, s_jc.id, w_mc.id, w_jc.id):
         row = await seg(rid)
         s = next(v for v in by_title.values() if v["title"] == row.title)
         p = s["probe"]
@@ -679,12 +745,25 @@ async def main():
               and abs(p["duration"] - row.expected_duration) < 2 and s["received"] == row.upload_total)
         check(ok, f"{row.title[:40]}…: {s['received'] / 1e6:.0f} МБ, {p['duration']:.1f} с, начало {p['start']:.2f} с",
               p)
+    joined_title = (await seg(s_jc.id)).title
+    joined = next(v for v in google.sessions.values() if v["title"] == joined_title)
+    dts = []
+    for sel in ("v:0", "a:0"):
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-select_streams", sel, "-show_entries", "packet=dts_time", "-of", "csv=p=0",
+            str(joined["path"]), stdout=asyncio.subprocess.PIPE)
+        out, _ = await proc.communicate()
+        dts.append([float(x) for x in out.split()])
+    steps = [b - a for track in dts for a, b in zip(track, track[1:])]
+    check(abs(joined["probe"]["duration"] - 60) < 1 and min(steps) > 0 and max(steps) < 0.05,
+          f"склеенный из двух отрезков ролик идёт без скачков времени ({joined['probe']['duration']:.2f} с, "
+          f"наибольший шаг {max(steps) * 1000:.0f} мс)", (min(steps), max(steps)))
     # Ролик, загрузка которого пережила сбои и перезапуск, байт в байт совпадает с заново собранным потоком
     row = await seg(n_mc.id)
     async with db() as s:
         vod = await s.get(Vod, VOD_NORMAL)
     async with httpx.AsyncClient(timeout=60) as http:
-        plan = await hls.build_plan(http, vod.playlist_url, row.start, row.end)
+        plan = await hls.build_plan(http, vod.playlist_url, get_spans(row))
         digest = hashlib.sha256()
         async for piece in hls.stream(http, plan):
             digest.update(piece)

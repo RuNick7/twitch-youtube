@@ -9,10 +9,14 @@ from app.segments import (
     category_warnings,
     fmt_duration,
     fmt_hms,
+    fmt_spans,
+    is_short_reason,
     normalize_chapters,
     parse_vod_id,
     plan_segments,
+    short_reason,
     skip_reason,
+    split_by_titles,
     split_list,
     twitch_time_param,
 )
@@ -139,17 +143,22 @@ class TitleTest(unittest.TestCase):
 
 class DescriptionTest(unittest.TestCase):
     def test_credit_link_and_fragment(self):
-        text = build_description("Строим замок", "Стример", "streamer", "29.09.2026", "Minecraft", "1:23:45", "3:10:00")
+        text = build_description("Строим замок", "Стример", "streamer", "29.09.2026", "Minecraft", [(5025, 11400)])
         self.assertIn("Фрагмент стрима Стример от 29.09.2026: Minecraft, 1:23:45–3:10:00.", text)
         self.assertIn("https://www.twitch.tv/streamer", text)
         self.assertIn("Опубликовано с разрешения автора.", text)
 
     def test_limits_and_forbidden_characters(self):
-        text = build_description("я<>" * 3000, "Стример", "bad<login>", "", "Minecraft", "0:00", "1:00:00")
+        text = build_description("я<>" * 3000, "Стример", "bad<login>", "", "Minecraft", [(0, 3600)])
         self.assertLessEqual(len(text.encode("utf-8")), 5000)
         self.assertNotIn("<", text)
         self.assertIn("https://www.twitch.tv/badlogin", text)
         self.assertIn("Опубликовано с разрешения автора.", text)
+
+
+    def test_joined_segment_lists_all_fragments(self):
+        text = build_description("Стрим", "Стример", "streamer", "", "Just Chatting", [(0, 2403), (17917, 27310)])
+        self.assertIn("Фрагменты стрима Стример: Just Chatting, 0:00–40:03, 4:58:37–7:35:10.", text)
 
 
 class TagsTest(unittest.TestCase):
@@ -234,6 +243,164 @@ class CategoryWarningsTest(unittest.TestCase):
     def test_regular_category(self):
         self.assertEqual(category_warnings("Minecraft", ["Slots"]), [])
 
+
+
+def titled(chapters, marks, **kwargs):
+    segments = plan_segments(split_by_titles([Chapter(*c) for c in chapters], marks), **kwargs)
+    return [(s.start, s.end, s.category, s.stream_title, s.part) for s in segments]
+
+
+class SplitByTitlesTest(unittest.TestCase):
+    def test_no_marks_keeps_chapters(self):
+        chapters = [Chapter(0, 100, "A")]
+        self.assertEqual(split_by_titles(chapters, []), chapters)
+
+    def test_title_change_splits_chapter(self):
+        result = split_by_titles([Chapter(0, 3600, "Minecraft")], [(0, "Строим"), (1800, "Взрываем")])
+        self.assertEqual(
+            [(c.start, c.end, c.title, c.stream_title) for c in result],
+            [(0, 1800, "Minecraft", "Строим"), (1800, 3600, "Minecraft", "Взрываем")],
+        )
+
+    def test_first_title_applies_from_start_even_if_seen_late(self):
+        result = split_by_titles([Chapter(0, 600, "A"), Chapter(600, 1200, "B")], [(300, "T")])
+        self.assertEqual([(c.start, c.end, c.stream_title) for c in result], [(0, 600, "T"), (600, 1200, "T")])
+
+    def test_repeated_title_and_marks_outside_vod_are_ignored(self):
+        result = split_by_titles([Chapter(0, 1000, "A")], [(-30, "T"), (400, "T"), (5000, "U")])
+        self.assertEqual([(c.start, c.end, c.stream_title) for c in result], [(0, 1000, "T")])
+
+
+class PlanWithTitlesTest(unittest.TestCase):
+    def test_category_and_title_both_cut(self):
+        self.assertEqual(
+            titled([(0, 3600, "Minecraft"), (3600, 7200, "Just Chatting")], [(0, "Строим"), (1800, "Взрываем")]),
+            [
+                (0, 1800, "Minecraft", "Строим", None),
+                (1800, 3600, "Minecraft", "Взрываем", None),
+                (3600, 7200, "Just Chatting", "Взрываем", None),
+            ],
+        )
+
+    def test_quick_typo_fix_joins_previous(self):
+        self.assertEqual(
+            titled([(0, 3600, "A")], [(0, "Т1"), (1800, "Опечатка"), (1830, "Т2")]),
+            [(0, 1830, "A", "Т1", None), (1830, 3600, "A", "Т2", None)],
+        )
+
+    def test_same_category_and_title_parts_are_numbered(self):
+        chapters = [(0, 1800, "Dota 2"), (1800, 3600, "B"), (3600, 5400, "Dota 2")]
+        self.assertEqual(
+            [part for *_, part in titled(chapters, [(0, "T")])],
+            [1, None, 2],
+        )
+
+    def test_no_part_categories(self):
+        chapters = [(0, 1800, "Just Chatting"), (1800, 3600, "Minecraft"), (3600, 5400, "Just Chatting")]
+        self.assertEqual(
+            [part for *_, part in titled(chapters, [(0, "T")], no_part=["just chatting", "Minecraft"])],
+            [None, None, None],
+        )
+
+    def test_different_titles_are_not_parts_of_each_other(self):
+        chapters = [(0, 1800, "A"), (1800, 3600, "B"), (3600, 5400, "A")]
+        self.assertEqual(
+            titled(chapters, [(0, "T1"), (3000, "T2")]),
+            [
+                (0, 1800, "A", "T1", None),
+                (1800, 3000, "B", "T1", None),
+                (3000, 3600, "B", "T2", None),
+                (3600, 5400, "A", "T2", None),
+            ],
+        )
+
+
+class ShortReasonTest(unittest.TestCase):
+    def test_threshold(self):
+        self.assertEqual(short_reason(6 * 60 + 59, 7), "короче 7 мин")
+        self.assertIsNone(short_reason(7 * 60, 7))
+        self.assertIsNone(short_reason(10, 0))
+
+    def test_recognized(self):
+        self.assertTrue(is_short_reason(short_reason(60, 7)))
+        self.assertFalse(is_short_reason(skip("Just Chatting", "Во все тяжкие")))
+        self.assertFalse(is_short_reason(None))
+
+
+class SkipBySegmentTitleTest(unittest.TestCase):
+    def test_only_the_series_part_of_the_stream_is_skipped(self):
+        segments = titled(
+            [(0, 3600, "Just Chatting"), (3600, 7200, "Minecraft"), (7200, 10800, "Just Chatting")],
+            [(0, "ФРИКЛЕНД - строим"), (7200, "Смотрим Во все тяжкие")],
+            no_part=["Just Chatting", "Minecraft"],
+        )
+        reasons = [skip(category, title) for _, _, category, title, _ in segments]
+        self.assertEqual([reason is None for reason in reasons], [True, True, False])
+
+
+def joined(*chapters, **kwargs):
+    segments = plan_segments([Chapter(*c) for c in chapters], join=True, **kwargs)
+    return [(s.category, s.spans, s.duration, s.part) for s in segments]
+
+
+class JoinRepeatedTest(unittest.TestCase):
+    def test_same_category_of_one_stream_becomes_one_video(self):
+        self.assertEqual(
+            joined((0, 2400, "Just Chatting"), (2400, 18000, "Minecraft"), (18000, 27000, "Just Chatting")),
+            [
+                ("Just Chatting", [(0, 2400), (18000, 27000)], 11400, None),
+                ("Minecraft", [(2400, 18000)], 15600, None),
+            ],
+        )
+
+    def test_different_titles_are_not_joined(self):
+        segments = plan_segments(
+            split_by_titles(
+                [Chapter(0, 2400, "Just Chatting"), Chapter(2400, 18000, "Minecraft"), Chapter(18000, 27000, "Just Chatting")],
+                [(0, "Стрим"), (17000, "Смотрим сериал")],
+            ),
+            join=True,
+        )
+        self.assertEqual(
+            [(s.category, s.stream_title, s.spans) for s in segments],
+            [
+                ("Just Chatting", "Стрим", [(0, 2400)]),
+                ("Minecraft", "Стрим", [(2400, 17000)]),
+                ("Minecraft", "Смотрим сериал", [(17000, 18000)]),
+                ("Just Chatting", "Смотрим сериал", [(18000, 27000)]),
+            ],
+        )
+
+    def test_misclick_is_still_absorbed_before_joining(self):
+        self.assertEqual(
+            joined((0, 3600, "A"), (3600, 3630, "B"), (3630, 7200, "C"), (7200, 9000, "B")),
+            [("A", [(0, 3630)], 3630, None), ("C", [(3630, 7200)], 3570, None), ("B", [(7200, 9000)], 1800, None)],
+        )
+
+    def test_too_long_joined_video_is_split_across_fragments(self):
+        hours = 3600
+        result = joined((0, 8 * hours, "A"), (8 * hours, 9 * hours, "B"), (9 * hours, 17 * hours, "A"))
+        self.assertEqual(result[0][:3], ("A", [(0, 8 * hours)], 8 * hours))
+        self.assertEqual(result[1][:3], ("A", [(9 * hours, 17 * hours)], 8 * hours))
+        self.assertEqual((result[0][3], result[1][3]), (1, 2))
+        self.assertEqual(result[2][:3], ("B", [(8 * hours, 9 * hours)], hours))
+
+    def test_split_point_inside_second_fragment(self):
+        hours = 3600
+        result = joined((0, 2 * hours, "A"), (2 * hours, 3 * hours, "B"), (3 * hours, 13 * hours, "A"))
+        # 12 часов одной категории — два ролика по 6 часов: 2 + 4 и ещё 6
+        self.assertEqual(result[0][1], [(0, 2 * hours), (3 * hours, 7 * hours)])
+        self.assertEqual(result[1][1], [(7 * hours, 13 * hours)])
+        self.assertTrue(all(duration <= SPLIT_LIMIT_SEC for _, _, duration, _ in result))
+
+    def test_without_join_repeats_stay_separate(self):
+        self.assertEqual(
+            plan((0, 3600, "A"), (3600, 7200, "B"), (7200, 10800, "A")),
+            [(0, 3600, "A", 1), (3600, 7200, "B", None), (7200, 10800, "A", 2)],
+        )
+
+    def test_fmt_spans(self):
+        self.assertEqual(fmt_spans([(0, 2403), (17917, 27310)]), "0:00–40:03, 4:58:37–7:35:10")
 
 if __name__ == "__main__":
     unittest.main()
