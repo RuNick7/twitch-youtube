@@ -68,7 +68,7 @@ import app.youtube as yt  # noqa: E402
 import httpx  # noqa: E402
 from aiogram import Bot  # noqa: E402
 from aiogram.client.session.base import BaseSession  # noqa: E402
-from sqlalchemy import delete, select, update  # noqa: E402
+from sqlalchemy import select, update  # noqa: E402
 from sqlalchemy.ext.asyncio import async_sessionmaker  # noqa: E402
 
 from app.db import (  # noqa: E402
@@ -83,6 +83,7 @@ from app.db import (  # noqa: E402
     as_utc,
     get_spans,
     get_warnings,
+    init_db,
     make_engine,
 )
 from app.tools import VodInfo, fetch_vod_info  # noqa: E402
@@ -704,7 +705,19 @@ async def main():
 
     t0 = time.monotonic()
     print("\n== 1. Запуск, YouTube, пауза", flush=True)
+    # База от версии с одним стримером: пауза и начало слежения лежат в общих ключах
+    (WORK / "data").mkdir(parents=True, exist_ok=True)
+    await init_db(engine)
+    legacy_since = datetime.now(timezone.utc)
+    async with db() as s, s.begin():
+        s.add_all([KV(key="watch_since", value=legacy_since.isoformat()), KV(key="paused", value="0")])
     task = await start_app()
+    async with db() as s:
+        row = (await s.scalars(select(Streamer))).one()
+        legacy = (await s.scalars(select(KV))).all()
+    check(row.title_name == "Заквиель" and row.paused is False and as_utc(row.watch_since) == legacy_since
+          and not legacy, "пауза, начало слежения и имя из STREAMER_NAME перенесены в запись стримера",
+          (row.title_name, row.paused, row.watch_since, [r.key for r in legacy]))
     reply = await say("/youtube")
     consent = reply[-1][0]
     text = tg.messages[consent]["text"]
@@ -718,7 +731,7 @@ async def main():
     check(True, "YouTube подключён по коду")
     # Канал будто подключили до появления плейлистов: согласие дано по старой версии политики
     async with db() as s, s.begin():
-        await s.execute(update(KV).where(KV.key == "consent_version").values(value="1"))
+        await s.execute(update(Streamer).values(consent_version=1))
     reply = await say("/pause")
     check("остановлены" in reply[-1][1]["text"], "/pause")
 
@@ -1025,7 +1038,7 @@ async def main():
 
     async def run_daily_check():
         async with db() as s, s.begin():
-            await s.execute(delete(KV).where(KV.key == refresher_mod.CHECKED_KEY))
+            await s.execute(update(Streamer).values(youtube_checked_at=None))
 
     async def streamer_row():
         async with db() as s:
@@ -1070,14 +1083,13 @@ async def main():
     async with db() as s:
         leftovers = (await s.scalars(select(Segment).where(
             (Segment.youtube_id.is_not(None)) | (Segment.upload_uri.is_not(None))))).all()
-        paused = await s.get(KV, "paused")
     check(not leftovers and all(r.status == Status.FORGOTTEN for r in rows),
           "ID роликов и сессий загрузки удалены", [(r.status, r.youtube_id) for r in rows])
-    check(paused and paused.value == "1", "после отключения обработка на паузе")
+    check(streamer.paused, "после отключения обработка на паузе")
     async with db() as s:
         left = (await s.scalars(select(Playlist))).all()
-        agreed = await s.get(KV, "consent_version")
-    check(not left and agreed is None, "ID плейлистов и согласие тоже удалены", (left, agreed))
+    check(not left and streamer.consent_version is None and streamer.consent_prompted is None,
+          "ID плейлистов и согласие тоже удалены", (left, streamer.consent_version, streamer.consent_prompted))
     check(buttons(tg.messages[s_jc.tg_message_id]["markup"]) == ["▶️ Twitch"],
           "под роликом, ждавшим решения, остались только ссылки", buttons(tg.messages[s_jc.tg_message_id]["markup"]))
 

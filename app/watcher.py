@@ -15,7 +15,7 @@ from html import escape
 from sqlalchemy import select
 
 from .context import App
-from .db import TitleChange, Vod, as_utc, kv_get, kv_set, utcnow
+from .db import TitleChange, Vod, as_utc, get_streamer, utcnow
 from .service import IngestError, ingest_vod
 from .tools import fetch_vod_info, list_channel_vods
 from .twitch import client_id, live_state
@@ -23,7 +23,6 @@ from .ui import local_time
 
 log = logging.getLogger(__name__)
 
-SINCE_KEY = "watch_since"
 ALERT_AFTER_FAILURES = 3
 TITLE_ALERT_AFTER_FAILURES = 10
 
@@ -54,12 +53,10 @@ class Watcher:
     async def _since(self) -> datetime:
         """С какого момента следим. Эфиры, закончившиеся раньше, не трогаем: их можно отдать через /process."""
         async with self.app.sessions() as session, session.begin():
-            value = await kv_get(session, SINCE_KEY)
-            if value:
-                return as_utc(datetime.fromisoformat(value))
-            now = utcnow()
-            await kv_set(session, SINCE_KEY, now.isoformat())
-            return now
+            streamer = await get_streamer(session, self.app.settings.twitch_channel)
+            if streamer.watch_since is None:
+                streamer.watch_since = utcnow()
+            return as_utc(streamer.watch_since)
 
     async def tick(self, since: datetime) -> None:
         app = self.app

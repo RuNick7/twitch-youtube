@@ -15,7 +15,7 @@ from sqlalchemy import func, select
 
 from . import consent
 from .context import App
-from .db import SHORT, Playlist, Segment, Status, Vod, find_streamer, get_streamer, utcnow
+from .db import SHORT, Playlist, Segment, Status, Streamer, Vod, find_streamer, get_streamer, utcnow
 from .segments import is_short_reason, parse_vod_id
 from .service import (
     DISCONNECTED_REASON,
@@ -151,7 +151,7 @@ async def connect_youtube(message: Message, app: App) -> None:
 async def accept_and_connect(query: CallbackQuery, app: App) -> None:
     await query.answer()
     await _drop_buttons(query)
-    await consent.accept(app)
+    await consent.accept(app, (await _streamer(app)).id)
     try:
         code = await app.youtube.start_device_flow()
     except (YouTubeError, httpx.HTTPError) as exc:
@@ -179,16 +179,22 @@ async def _finish_youtube(app: App, code: DeviceCode, prompt: Message) -> None:
         streamer.youtube_token = app.vault.encrypt(refresh_token)
         streamer.youtube_channel_id = channel_id
         streamer.youtube_channel_title = title
-    paused = "\nОбработка на паузе: /resume — продолжить." if await is_paused(app) else ""
+    paused = "\nОбработка на паузе: /resume — продолжить." if await is_paused(app, streamer.id) else ""
     await prompt.edit_text(f"✅ Подключён канал «{escape(title)}»{paused}")
 
 
 @owner.callback_query(YouTubeAction.filter(F.action.startswith(ACCEPT)))
 async def accept_policy(query: CallbackQuery, callback_data: YouTubeAction, app: App) -> None:
     """Согласие с обновлённой политикой без повторного входа в Google. Принимается та версия, что была показана."""
-    await consent.accept(app, accepted_from_action(callback_data.action))
+    await consent.accept(app, (await _streamer(app)).id, accepted_from_action(callback_data.action))
     await query.answer("Принято")
     await _drop_buttons(query)
+
+
+async def _streamer(app: App) -> Streamer:
+    """Стример из TWITCH_CHANNEL: команды и кнопки бота пока работают с ним одним."""
+    async with app.sessions() as session, session.begin():
+        return await get_streamer(session, app.settings.twitch_channel)
 
 
 @owner.message(Command("disconnect"))
@@ -220,7 +226,7 @@ async def confirm_disconnect(query: CallbackQuery, app: App) -> None:
             f"🔴 Google не отозвал доступ: {escape(str(exc))}. Данные не удалены, попробуйте ещё раз: /disconnect"
         )
         return
-    await set_paused(app, True)
+    await set_paused(app, True, streamer.id)
     await forget_youtube(app, streamer.id, DISCONNECTED_REASON)
     text = (
         f"✅ Канал «{escape(streamer.youtube_channel_title or '')}» отключён: доступ в Google отозван, "
@@ -266,7 +272,7 @@ async def show_status(message: Message, app: App) -> None:
     segments = ", ".join(f"{label} {counts[key]}" for key, label in STATUS_LABELS if counts.get(key))
     shorts_done = ", ".join(f"{label} {short_counts[key]}" for key, label in STATUS_LABELS if short_counts.get(key))
     disk = shutil.disk_usage(app.settings.data_dir)
-    paused = await is_paused(app)
+    paused = bool(streamer and streamer.paused)
     settings = app.settings
     publishing = (
         f"{PUBLISH_PLACES[settings.publish_privacy]} через {settings.publish_delay_min} мин после обработки"
@@ -279,7 +285,7 @@ async def show_status(message: Message, app: App) -> None:
         playlists = "выключены (PLAYLISTS=false)"
     elif not (streamer and streamer.youtube_token):
         playlists = "YouTube-канал не подключён"
-    elif await consent.accepted_version(app) < consent.PLAYLISTS_SINCE:
+    elif consent.accepted_version(streamer) < consent.PLAYLISTS_SINCE:
         playlists = "ждут согласия с обновлённой политикой конфиденциальности"
     else:
         playlists = f"по категориям, создано {playlist_count}"
@@ -287,7 +293,7 @@ async def show_status(message: Message, app: App) -> None:
         shorts = "выключены (SHORTS=false)"
     elif not (streamer and streamer.youtube_token):
         shorts = "YouTube-канал не подключён"
-    elif await consent.accepted_version(app) < consent.SHORTS_SINCE:
+    elif consent.accepted_version(streamer) < consent.SHORTS_SINCE:
         shorts = "ждут согласия с обновлённой политикой конфиденциальности"
     else:
         shorts = (

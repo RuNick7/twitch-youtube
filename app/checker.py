@@ -71,30 +71,30 @@ class Checker:
             try:
                 items = await self.app.youtube.videos(token, [seg.youtube_id for seg in segments])
             except AuthError:
-                await self._auth_lost()
+                await self._auth_lost(streamer)
                 return
             except (YouTubeError, httpx.HTTPError) as exc:
                 log.warning("Не удалось проверить ролики на YouTube: %s", exc)
                 continue
             for seg in segments:
                 try:
-                    await self.check(seg, items.get(seg.youtube_id))
+                    await self.check(seg, items.get(seg.youtube_id), streamer)
                 except AuthError:
-                    await self._auth_lost()
+                    await self._auth_lost(streamer)
                     return
                 except (YouTubeError, httpx.HTTPError) as exc:
                     log.warning("Не удалось обработать ролик %s: %s", seg.youtube_id, exc)
                     await update_segment(self.app, seg.id, check_at=utcnow() + RECHECK)
 
-    async def _auth_lost(self) -> None:
+    async def _auth_lost(self, streamer: Streamer) -> None:
         self.skip_until = utcnow() + AUTH_BACKOFF
-        if not await is_paused(self.app):
-            await set_paused(self.app, True)
+        if not await is_paused(self.app, streamer.id):
+            await set_paused(self.app, True, streamer.id)
             await self.app.notify(
                 "🔴 Обработка на паузе: доступ к YouTube отозван или истёк. Выполните /youtube, затем /resume"
             )
 
-    async def check(self, seg: Segment, item: dict | None) -> None:
+    async def check(self, seg: Segment, item: dict | None, streamer: Streamer) -> None:
         app = self.app
         now = utcnow()
         if item is None:
@@ -132,7 +132,7 @@ class Checker:
                     reply_to=seg.tg_message_id,
                 )
                 return
-            if await is_paused(app):
+            if await is_paused(app, streamer.id):
                 await update_segment(app, seg.id, check_at=now + RECHECK)
                 return
             await publish(app, seg.id)

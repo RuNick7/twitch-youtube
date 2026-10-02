@@ -11,7 +11,7 @@ from html import escape
 from sqlalchemy import select, update
 
 from .context import App
-from .db import SHORT, Segment, Status, Streamer, Vod, get_spans, kv_get, kv_set, utcnow
+from .db import SHORT, Segment, Status, Streamer, Vod, get_spans, utcnow
 from .hls import Plan, SourceError, build_plan, stream
 from .service import DISCONNECTED_REASON, build_metadata, update_segment
 from .shorts import file_stream, prepare_short, short_metadata
@@ -20,25 +20,28 @@ from .youtube import LIMIT_REASONS, AuthError, StreamFactory, YouTubeError
 
 log = logging.getLogger(__name__)
 
-PAUSED_KEY = "paused"
 FIRST_CHECK_AFTER = timedelta(minutes=2)
 
 
 class Blocked(Exception):
     """Проблема не в сегменте (нет доступа, упёрлись в лимит).
 
-    Обработка встаёт на паузу, а сегмент остаётся первым в очереди.
+    Стример встаёт на паузу, а сегмент остаётся первым в его очереди.
     """
 
 
-async def is_paused(app: App) -> bool:
+async def is_paused(app: App, streamer_id: int) -> bool:
     async with app.sessions() as session:
-        return await kv_get(session, PAUSED_KEY) == "1"
+        return bool(await session.scalar(select(Streamer.paused).where(Streamer.id == streamer_id)))
 
 
-async def set_paused(app: App, paused: bool) -> None:
+async def set_paused(app: App, paused: bool, streamer_id: int | None = None) -> None:
+    """Ставит на паузу или снимает с неё стримера, а без streamer_id — всех стримеров (/pause и /resume)."""
+    query = update(Streamer).values(paused=paused)
+    if streamer_id is not None:
+        query = query.where(Streamer.id == streamer_id)
     async with app.sessions() as session, session.begin():
-        await kv_set(session, PAUSED_KEY, "1" if paused else "0")
+        await session.execute(query)
     if not paused:
         app.wake.set()
 
@@ -52,11 +55,10 @@ class Worker:
         while True:
             self.app.wake.clear()
             try:
-                if not await is_paused(self.app):
-                    segment_id = await self._next()
-                    if segment_id is not None:
-                        await self._process(segment_id)
-                        continue
+                segment_id = await self._next()
+                if segment_id is not None:
+                    await self._process(segment_id)
+                    continue
             except Exception:
                 log.exception("Сбой в очереди загрузки")
             try:
@@ -75,10 +77,13 @@ class Worker:
             )
 
     async def _next(self) -> int | None:
+        """Первый в очереди сегмент стримера, который не на паузе."""
         async with self.app.sessions() as session:
             return await session.scalar(
                 select(Segment.id)
-                .where(Segment.status == Status.QUEUED)
+                .join(Vod, Vod.id == Segment.vod_id)
+                .join(Streamer, Streamer.id == Vod.streamer_id)
+                .where(Segment.status == Status.QUEUED, Streamer.paused.is_not(True))
                 .order_by(Segment.queued_at, Segment.id)
                 .limit(1)
             )
@@ -114,7 +119,7 @@ class Worker:
                 )
         except Blocked as exc:
             await update_segment(app, segment_id, status=Status.QUEUED)
-            await set_paused(app, True)
+            await set_paused(app, True, streamer.id)
             await app.refresh_segment(segment_id)
             await app.notify(f"🔴 Обработка на паузе: {escape(str(exc))}", reply_to=seg.tg_message_id)
             return

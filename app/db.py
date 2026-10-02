@@ -40,14 +40,28 @@ class Base(DeclarativeBase):
 
 
 class Streamer(Base):
+    """Стример и его YouTube-канал: у каждого стримера свой канал, своя пауза и своё согласие с политикой."""
+
     __tablename__ = "streamers"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     login: Mapped[str] = mapped_column(String(64), unique=True)
-    display_name: Mapped[str | None] = mapped_column(String(128))
+    display_name: Mapped[str | None] = mapped_column(String(128))  # название канала на Twitch
+    # Имя в конце названий роликов и плейлистов — так стримера ищут зрители («Заквиель»)
+    title_name: Mapped[str | None] = mapped_column(String(128))
+    paused: Mapped[bool | None]  # загрузка и публикация остановлены: /pause или пропал доступ к YouTube
+    watch_since: Mapped[datetime | None]  # эфиры, закончившиеся раньше, слежение не трогает
     youtube_channel_id: Mapped[str | None] = mapped_column(String(64))
     youtube_channel_title: Mapped[str | None] = mapped_column(String(256))
     youtube_token: Mapped[str | None] = mapped_column(Text)  # refresh-токен, зашифрован
+    youtube_checked_at: Mapped[datetime | None]  # последняя ежедневная сверка с YouTube
+    consent_version: Mapped[int | None]  # версия политики, которую принял владелец канала (consent.py)
+    consent_prompted: Mapped[int | None]  # версия, принять которую бот уже предлагал
+
+    @property
+    def public_name(self) -> str:
+        """Имя стримера в названиях роликов и плейлистов; без title_name — название канала на Twitch."""
+        return self.title_name or self.display_name or self.login
 
 
 class Vod(Base):
@@ -228,14 +242,33 @@ async def get_clips_vod(session: AsyncSession, streamer: Streamer) -> Vod:
     return vod
 
 
-async def kv_get(session: AsyncSession, key: str) -> str | None:
-    row = await session.get(KV, key)
-    return row.value if row else None
+# Пока стример был один, его состояние хранилось в общих ключах KV
+LEGACY_KEYS = ("paused", "consent_version", "consent_prompted", "watch_since", "youtube_checked_at")
 
 
-async def kv_set(session: AsyncSession, key: str, value: str) -> None:
-    await session.merge(KV(key=key, value=value))
+async def adopt_legacy_state(session: AsyncSession, streamer: Streamer, title_name: str = "") -> None:
+    """Переносит в запись стримера то, что хранилось общим, пока стример был один: паузу, согласие
+    с политикой, начало слежения и время сверки с YouTube из KV, имя для названий из STREAMER_NAME.
+
+    Перенесённые ключи удаляются, уже заполненные поля не перезаписываются: повторный вызов ничего не меняет.
+    """
+    legacy = {row.key: row.value for row in (await session.scalars(select(KV).where(KV.key.in_(LEGACY_KEYS)))).all()}
+    if "paused" in legacy and streamer.paused is None:
+        streamer.paused = legacy["paused"] == "1"
+    for key in ("consent_version", "consent_prompted"):
+        if getattr(streamer, key) is None and legacy.get(key, "").isdigit():
+            setattr(streamer, key, int(legacy[key]))
+    for key in ("watch_since", "youtube_checked_at"):
+        if getattr(streamer, key) is None and key in legacy:
+            setattr(streamer, key, _parse_time(legacy[key]))
+    if legacy:
+        await session.execute(delete(KV).where(KV.key.in_(LEGACY_KEYS)))
+    if title_name and not streamer.title_name:
+        streamer.title_name = title_name
 
 
-async def kv_delete(session: AsyncSession, key: str) -> None:
-    await session.execute(delete(KV).where(KV.key == key))
+def _parse_time(value: str) -> datetime | None:
+    try:
+        return as_utc(datetime.fromisoformat(value)).astimezone(timezone.utc)
+    except ValueError:
+        return None

@@ -8,7 +8,6 @@ from html import escape
 
 from sqlalchemy import delete, func, select, update
 
-from . import consent
 from .context import App
 from .db import (
     Playlist,
@@ -111,7 +110,6 @@ async def ingest_vod(app: App, info: VodInfo) -> int:
         streamer = await get_streamer(session, settings.twitch_channel)
         if info.uploader:
             streamer.display_name = info.uploader
-        name = streamer.display_name or streamer.login
         numbers = number_parts(
             planned,
             [reason is None for reason in reasons],
@@ -131,7 +129,7 @@ async def ingest_vod(app: App, info: VodInfo) -> int:
         session.add(vod)
         await session.flush()
         # В конце названия — имя, по которому стримера ищут зрители, а не название его канала
-        title_name = settings.streamer_name or name
+        title_name = streamer.public_name
         segments = []
         for i, (p, stream_title, reason, part) in enumerate(zip(planned, stream_titles, reasons, numbers), 1):
             segments.append(
@@ -193,8 +191,7 @@ async def queue_skipped(app: App, segment_id: int, review: bool) -> bool:
             vod = await session.get(Vod, seg.vod_id)
             streamer = await session.get(Streamer, vod.streamer_id)
             seg.part = (await upload_counts(session, streamer.id)).get(key, 0) + 1
-            name = app.settings.streamer_name or streamer.display_name or streamer.login
-            seg.title = build_title(seg.category, seg.stream_title or vod.title, name, seg.part)
+            seg.title = build_title(seg.category, seg.stream_title or vod.title, streamer.public_name, seg.part)
         seg.status = Status.QUEUED
         seg.queued_at = utcnow()
         seg.force_review = review
@@ -265,6 +262,8 @@ async def forget_youtube(app: App, streamer_id: int, reason: str) -> None:
         if streamer.youtube_token:
             app.youtube.forget(app.vault.decrypt(streamer.youtube_token))
         streamer.youtube_token = streamer.youtube_channel_id = streamer.youtube_channel_title = None
+        # Согласие с политикой спросим заново при следующем подключении
+        streamer.consent_version = streamer.consent_prompted = None
         await session.execute(delete(Playlist).where(Playlist.streamer_id == streamer_id))
         # У этих сегментов в Telegram кнопки, которые больше ничего не сделают
         with_buttons = list(
@@ -287,7 +286,6 @@ async def forget_youtube(app: App, streamer_id: int, reason: str) -> None:
         await session.execute(
             update(Segment).where(Segment.vod_id.in_(vods), Segment.upload_uri.is_not(None)).values(upload_uri=None)
         )
-    await consent.forget(app)
     for segment_id in with_buttons:
         await app.refresh_segment(segment_id)
 
@@ -301,7 +299,6 @@ async def status_counts(app: App, kind: str | None = None) -> dict[str, int]:
 
 
 def build_metadata(app: App, seg: Segment, vod: Vod, streamer: Streamer) -> dict:
-    settings = app.settings
     name = streamer.display_name or streamer.login
     snippet = {
         "title": seg.title,
@@ -313,7 +310,7 @@ def build_metadata(app: App, seg: Segment, vod: Vod, streamer: Streamer) -> dict
             seg.category,
             get_spans(seg),
         ),
-        "tags": build_tags(seg.category, settings.streamer_name, name, streamer.login, "стрим", "twitch"),
+        "tags": build_tags(seg.category, streamer.title_name, name, streamer.login, "стрим", "twitch"),
     }
     return video_metadata(app, snippet)
 

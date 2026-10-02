@@ -31,12 +31,12 @@ async def sync_playlists(app: App) -> None:
     if not app.settings.playlists or _lock.locked():
         return
     async with _lock:
-        if await accepted_version(app) < PLAYLISTS_SINCE:
-            return  # владелец ещё не принял политику, где описаны плейлисты
         async with app.sessions() as session:
             streamers = list((await session.scalars(select(Streamer).where(Streamer.youtube_token.is_not(None)))).all())
         for streamer in streamers:
-            await _sync(app, streamer)
+            # Пока владелец канала не принял политику, где описаны плейлисты, бот их не трогает
+            if accepted_version(streamer) >= PLAYLISTS_SINCE:
+                await _sync(app, streamer)
 
 
 async def _sync(app: App, streamer: Streamer) -> None:
@@ -91,7 +91,7 @@ async def _sync(app: App, streamer: Streamer) -> None:
 
 async def _create(app: App, streamer: Streamer, token: str, category: str, key: str) -> str:
     settings = app.settings
-    name = settings.streamer_name or streamer.display_name or streamer.login
+    name = streamer.public_name
     if category == SHORTS_PLAYLIST:
         what = f"Shorts из клипов стримов {name}"
     else:

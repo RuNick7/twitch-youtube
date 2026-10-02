@@ -26,7 +26,6 @@ from .db import (
     Status,
     Streamer,
     TitleChange,
-    Vod,
     dump_warnings,
     find_streamer,
     get_clips_vod,
@@ -82,10 +81,12 @@ class ShortsScout:
     async def scan(self) -> int:
         """Ставит в очередь новые клипы и возвращает, сколько Shorts добавлено (вместе с пропущенными)."""
         app, settings = self.app, self.app.settings
-        if not settings.shorts or await accepted_version(app) < SHORTS_SINCE:
+        if not settings.shorts:
             return 0
         async with app.sessions() as session:
             streamer = await find_streamer(session, settings.twitch_channel)
+            if streamer is None or accepted_version(streamer) < SHORTS_SINCE:
+                return 0  # владелец канала ещё не принял политику, где описаны Shorts
             stored = list((await session.scalars(select(Segment).where(Segment.kind == SHORT))).all())
             recent = await session.scalar(
                 select(func.count())
@@ -97,7 +98,7 @@ class ShortsScout:
                 )
             )
         self._clean_files(stored)
-        if not (streamer and streamer.youtube_token):
+        if not streamer.youtube_token:
             return 0
         if self.client is None:
             self.client = await client_id()
@@ -158,7 +159,7 @@ class ShortsScout:
 
     async def _add(self, streamer: Streamer, clip: Clip, stream_title: str | None, reason: str | None) -> None:
         app, settings = self.app, self.app.settings
-        name = settings.streamer_name or streamer.display_name or streamer.login
+        name = streamer.public_name
         category = clip.category or FALLBACK_CATEGORY
         start, end = clip.span or (0, max(1, round(clip.duration)))
         async with app.sessions() as session, session.begin():
@@ -259,7 +260,6 @@ def file_stream(path: Path) -> StreamFactory:
 
 async def short_metadata(app: App, seg: Segment, streamer: Streamer) -> dict:
     """Метаданные Shorts. Если ролик стрима с этим моментом уже опубликован, в описании ссылка на него."""
-    settings = app.settings
     full_video = None
     if seg.clip_vod_id:
         async with app.sessions() as session:
@@ -286,7 +286,7 @@ async def short_metadata(app: App, seg: Segment, streamer: Streamer) -> dict:
             seg.clip_author,
             full_video,
         ),
-        "tags": build_tags(seg.category, settings.streamer_name, name, streamer.login, "shorts", "клип", "twitch"),
+        "tags": build_tags(seg.category, streamer.title_name, name, streamer.login, "shorts", "клип", "twitch"),
     }
     return video_metadata(app, snippet)
 

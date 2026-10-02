@@ -19,7 +19,7 @@ from .config import Settings
 from .consent import prompt_update
 from .context import App
 from .crypto import Vault
-from .db import get_streamer, init_db, make_engine
+from .db import adopt_legacy_state, get_streamer, init_db, make_engine
 from .refresher import Refresher
 from .shorts import ShortsScout
 from .tools import update_ytdlp, ytdlp_version
@@ -51,7 +51,8 @@ async def main() -> None:
     await init_db(engine)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     async with sessions() as session, session.begin():
-        await get_streamer(session, settings.twitch_channel)
+        streamer = await get_streamer(session, settings.twitch_channel)
+        await adopt_legacy_state(session, streamer, settings.streamer_name)
 
     bot = Bot(
         settings.telegram_bot_token,
