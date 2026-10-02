@@ -1,5 +1,5 @@
-"""Точка входа: бот, слежение за каналом, очередь загрузки, проверка роликов, ежедневная сверка с YouTube
-и обновление yt-dlp в одном процессе."""
+"""Точка входа: бот, слежение за каналом и клипами, очередь загрузки, проверка роликов,
+ежедневная сверка с YouTube и обновление yt-dlp в одном процессе."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from .context import App
 from .crypto import Vault
 from .db import get_streamer, init_db, make_engine
 from .refresher import Refresher
+from .shorts import ShortsScout
 from .tools import update_ytdlp, ytdlp_version
 from .watcher import TitleTracker, Watcher
 from .worker import Worker
@@ -76,6 +77,8 @@ async def main() -> None:
         app.spawn(Worker(app).run())
         app.spawn(Checker(app).run())
         app.spawn(Refresher(app).run())
+        if settings.shorts:
+            app.spawn(ShortsScout(app).run())
         if settings.watch_interval_sec > 0:
             app.spawn(Watcher(app).run())
         else:

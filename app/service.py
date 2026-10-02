@@ -168,7 +168,7 @@ async def upload_counts(session, streamer_id: int) -> dict[str, int]:
     rows = await session.execute(
         select(Segment.category, func.count())
         .join(Vod, Vod.id == Segment.vod_id)
-        .where(Vod.streamer_id == streamer_id, Segment.status != Status.SKIPPED)
+        .where(Vod.streamer_id == streamer_id, Segment.status != Status.SKIPPED, Segment.kind.is_(None))
         .group_by(Segment.category)
     )
     counts: dict[str, int] = {}
@@ -188,7 +188,8 @@ async def queue_skipped(app: App, segment_id: int, review: bool) -> bool:
         if seg is None or seg.status != Status.SKIPPED:
             return False
         key = category_key(seg.category)
-        if key not in {category_key(category) for category in app.settings.unnumbered_categories}:
+        numbered = key not in {category_key(category) for category in app.settings.unnumbered_categories}
+        if seg.kind is None and numbered:  # у Shorts номера части нет
             vod = await session.get(Vod, seg.vod_id)
             streamer = await session.get(Streamer, vod.streamer_id)
             seg.part = (await upload_counts(session, streamer.id)).get(key, 0) + 1
@@ -291,9 +292,11 @@ async def forget_youtube(app: App, streamer_id: int, reason: str) -> None:
         await app.refresh_segment(segment_id)
 
 
-async def status_counts(app: App) -> dict[str, int]:
+async def status_counts(app: App, kind: str | None = None) -> dict[str, int]:
+    """Число сегментов (kind=None) или Shorts (kind=SHORT) по статусам."""
+    condition = Segment.kind.is_(None) if kind is None else Segment.kind == kind
     async with app.sessions() as session:
-        rows = await session.execute(select(Segment.status, func.count()).group_by(Segment.status))
+        rows = await session.execute(select(Segment.status, func.count()).where(condition).group_by(Segment.status))
     return {status: count for status, count in rows.all()}
 
 
@@ -311,8 +314,14 @@ def build_metadata(app: App, seg: Segment, vod: Vod, streamer: Streamer) -> dict
             get_spans(seg),
         ),
         "tags": build_tags(seg.category, settings.streamer_name, name, streamer.login, "стрим", "twitch"),
-        "categoryId": settings.youtube_category_id,
     }
+    return video_metadata(app, snippet)
+
+
+def video_metadata(app: App, snippet: dict) -> dict:
+    """Метаданные для videos.insert: язык, категория YouTube и приватный доступ."""
+    settings = app.settings
+    snippet = {**snippet, "categoryId": settings.youtube_category_id}
     if settings.youtube_language:
         snippet["defaultLanguage"] = settings.youtube_language
         snippet["defaultAudioLanguage"] = settings.youtube_language

@@ -15,7 +15,7 @@ from sqlalchemy import func, select
 
 from . import consent
 from .context import App
-from .db import Playlist, Segment, Status, Vod, find_streamer, get_streamer, utcnow
+from .db import SHORT, Playlist, Segment, Status, Vod, find_streamer, get_streamer, utcnow
 from .segments import is_short_reason, parse_vod_id
 from .service import (
     DISCONNECTED_REASON,
@@ -40,6 +40,7 @@ from .ui import (
     RETRY,
     SegmentAction,
     YouTubeAction,
+    accepted_from_action,
     confirm_keyboard,
     render_consent,
     render_disconnect,
@@ -51,7 +52,8 @@ log = logging.getLogger(__name__)
 
 HELP = (
     "Бот сам следит за каналом. После конца стрима сегменты загружаются на YouTube приватно, "
-    "ролики без предупреждений публикуются, по остальным бот спросит.\n\n"
+    "ролики без предупреждений публикуются, по остальным бот спросит. Самые просматриваемые "
+    "клипы канала становятся Shorts.\n\n"
     "/process &lt;ссылка на VOD&gt; — обработать VOD вручную (старый или пропущенный)\n"
     "/youtube — подключить YouTube-канал\n"
     "/disconnect — отключить YouTube-канал и удалить сохранённые о нём данные\n"
@@ -181,11 +183,11 @@ async def _finish_youtube(app: App, code: DeviceCode, prompt: Message) -> None:
     await prompt.edit_text(f"✅ Подключён канал «{escape(title)}»{paused}")
 
 
-@owner.callback_query(YouTubeAction.filter(F.action == ACCEPT))
-async def accept_policy(query: CallbackQuery, app: App) -> None:
-    """Согласие с обновлённой политикой без повторного входа в Google."""
-    await consent.accept(app)
-    await query.answer("Принято: плейлисты включены")
+@owner.callback_query(YouTubeAction.filter(F.action.startswith(ACCEPT)))
+async def accept_policy(query: CallbackQuery, callback_data: YouTubeAction, app: App) -> None:
+    """Согласие с обновлённой политикой без повторного входа в Google. Принимается та версия, что была показана."""
+    await consent.accept(app, accepted_from_action(callback_data.action))
+    await query.answer("Принято")
     await _drop_buttons(query)
 
 
@@ -253,6 +255,7 @@ async def _drop_buttons(query: CallbackQuery) -> None:
 @owner.message(Command("status"))
 async def show_status(message: Message, app: App) -> None:
     counts = await status_counts(app)
+    short_counts = await status_counts(app, SHORT)
     async with app.sessions() as session:
         streamer = await find_streamer(session, app.settings.twitch_channel)
     youtube = (
@@ -261,6 +264,7 @@ async def show_status(message: Message, app: App) -> None:
         else "не подключён, выполните /youtube"
     )
     segments = ", ".join(f"{label} {counts[key]}" for key, label in STATUS_LABELS if counts.get(key))
+    shorts_done = ", ".join(f"{label} {short_counts[key]}" for key, label in STATUS_LABELS if short_counts.get(key))
     disk = shutil.disk_usage(app.settings.data_dir)
     paused = await is_paused(app)
     settings = app.settings
@@ -275,10 +279,21 @@ async def show_status(message: Message, app: App) -> None:
         playlists = "выключены (PLAYLISTS=false)"
     elif not (streamer and streamer.youtube_token):
         playlists = "YouTube-канал не подключён"
-    elif await consent.accepted_version(app) < consent.CONSENT_VERSION:
+    elif await consent.accepted_version(app) < consent.PLAYLISTS_SINCE:
         playlists = "ждут согласия с обновлённой политикой конфиденциальности"
     else:
         playlists = f"по категориям, создано {playlist_count}"
+    if not settings.shorts:
+        shorts = "выключены (SHORTS=false)"
+    elif not (streamer and streamer.youtube_token):
+        shorts = "YouTube-канал не подключён"
+    elif await consent.accepted_version(app) < consent.SHORTS_SINCE:
+        shorts = "ждут согласия с обновлённой политикой конфиденциальности"
+    else:
+        shorts = (
+            f"из клипов за 7 дней от {settings.shorts_min_views} просмотров, не больше {settings.shorts_per_day} "
+            f"в сутки; {shorts_done or 'пока нет'}"
+        )
     await message.answer(
         "\n".join(
             [
@@ -289,6 +304,7 @@ async def show_status(message: Message, app: App) -> None:
                 f"Автопубликация: {publishing}",
                 f"Плейлисты: {playlists}",
                 f"Сегменты: {segments or 'пока нет'}",
+                f"Shorts: {shorts}",
                 f"Диск: свободно {disk.free / 1024**3:.0f} из {disk.total / 1024**3:.0f} ГБ",
                 f"yt-dlp: {escape(app.ytdlp_version)}",
             ]

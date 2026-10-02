@@ -34,6 +34,7 @@ class App:
     tz: ZoneInfo
     wake: asyncio.Event = field(default_factory=asyncio.Event)  # будит очередь загрузки
     sync_wake: asyncio.Event = field(default_factory=asyncio.Event)  # будит раскладку роликов по плейлистам
+    shorts_wake: asyncio.Event = field(default_factory=asyncio.Event)  # будит проверку клипов для Shorts
     ytdlp_version: str = "?"
     watch_state: str = "ещё не проверялся"  # для /status
     live_title: str | None = None  # название идущего стрима, если он идёт

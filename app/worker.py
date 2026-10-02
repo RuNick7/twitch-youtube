@@ -1,4 +1,4 @@
-"""Очередь загрузки: сегменты по одному идут потоком с Twitch на YouTube, приватно."""
+"""Очередь загрузки: сегменты по одному идут потоком с Twitch на YouTube, приватно; Shorts — готовым файлом."""
 
 from __future__ import annotations
 
@@ -11,11 +11,12 @@ from html import escape
 from sqlalchemy import select, update
 
 from .context import App
-from .db import Segment, Status, Streamer, Vod, get_spans, kv_get, kv_set, utcnow
+from .db import SHORT, Segment, Status, Streamer, Vod, get_spans, kv_get, kv_set, utcnow
 from .hls import Plan, SourceError, build_plan, stream
 from .service import DISCONNECTED_REASON, build_metadata, update_segment
+from .shorts import file_stream, prepare_short, short_metadata
 from .tools import fetch_vod_info
-from .youtube import LIMIT_REASONS, AuthError, YouTubeError
+from .youtube import LIMIT_REASONS, AuthError, StreamFactory, YouTubeError
 
 log = logging.getLogger(__name__)
 
@@ -94,8 +95,23 @@ class Worker:
             refresh_token = app.vault.decrypt(streamer.youtube_token)
             await update_segment(app, segment_id, status=Status.UPLOADING, error=None)
             await app.refresh_segment(segment_id)
-            plan = await self._plan(seg, vod)
-            video_id = await self._upload(seg, vod, streamer, refresh_token, plan)
+            if seg.kind == SHORT:
+                path = await prepare_short(app, seg)
+                metadata = await short_metadata(app, seg, streamer)
+                video_id = await self._upload(
+                    seg, refresh_token, path.stat().st_size, seg.expected_duration or 0, file_stream(path), metadata
+                )
+                path.unlink(missing_ok=True)
+            else:
+                plan = await self._plan(seg, vod)
+                video_id = await self._upload(
+                    seg,
+                    refresh_token,
+                    plan.total,
+                    round(plan.duration),
+                    lambda offset: stream(app.http, plan, offset),
+                    build_metadata(app, seg, vod, streamer),
+                )
         except Blocked as exc:
             await update_segment(app, segment_id, status=Status.QUEUED)
             await set_paused(app, True)
@@ -111,8 +127,9 @@ class Worker:
             log.exception("Сегмент %s не загружен", segment_id)
             await update_segment(app, segment_id, status=Status.FAILED, error=str(exc)[:1000])
             await app.refresh_segment(segment_id)
+            what = "Shorts" if seg.kind == SHORT else "Сегмент"
             await app.notify(
-                f"🔴 Сегмент «{escape(seg.title)}» не загружен: {escape(str(exc)[:500])}",
+                f"🔴 {what} «{escape(seg.title)}» не загружен: {escape(str(exc)[:500])}",
                 reply_to=seg.tg_message_id,
             )
             return
@@ -153,15 +170,18 @@ class Worker:
             await session.execute(update(Vod).where(Vod.id == vod.id).values(playlist_url=info.playlist_url))
         return await build_plan(self.app.http, info.playlist_url, get_spans(seg))
 
-    async def _upload(self, seg: Segment, vod: Vod, streamer: Streamer, refresh_token: str, plan: Plan) -> str:
+    async def _upload(
+        self, seg: Segment, refresh_token: str, total: int, duration: int, open_stream: StreamFactory, metadata: dict
+    ) -> str:
+        """Загружает ролик с докачкой: open_stream(offset) каждый раз отдаёт одни и те же байты."""
         app = self.app
-        # Если VOD на Twitch изменился (например, Twitch заглушил фрагменты), старую сессию не продолжить
-        session_uri = seg.upload_uri if seg.upload_total == plan.total else None
+        # Если источник изменился (например, Twitch заглушил фрагменты VOD), старую сессию не продолжить
+        session_uri = seg.upload_uri if seg.upload_total == total else None
         await update_segment(
             app,
             seg.id,
-            upload_total=plan.total,
-            expected_duration=round(plan.duration),
+            upload_total=total,
+            expected_duration=duration,
             upload_uri=session_uri,
             progress=0,
         )
@@ -186,9 +206,9 @@ class Worker:
         try:
             return await app.youtube.upload_stream(
                 refresh_token,
-                plan.total,
-                lambda offset: stream(app.http, plan, offset),
-                build_metadata(app, seg, vod, streamer),
+                total,
+                open_stream,
+                metadata,
                 session_uri=session_uri,
                 on_session=on_session,
                 on_progress=on_progress,

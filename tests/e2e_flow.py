@@ -59,6 +59,7 @@ import app.checker as checker_mod  # noqa: E402
 import app.hls as hls  # noqa: E402
 import app.refresher as refresher_mod  # noqa: E402
 import app.service as service_mod  # noqa: E402
+import app.shorts as shorts_mod  # noqa: E402
 import app.watcher as watcher_mod  # noqa: E402
 import app.worker as worker_mod  # noqa: E402
 import app.youtube as yt  # noqa: E402
@@ -70,6 +71,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker  # noqa: E402
 
 from app.db import (  # noqa: E402
     KV,
+    SHORT,
     Playlist,
     Segment,
     Status,
@@ -94,6 +96,38 @@ refresher_mod.TICK_SEC = 1
 checker_mod.RECHECK = timedelta(seconds=1)
 checker_mod.MONITOR_EVERY = service_mod.MONITOR_EVERY = timedelta(seconds=3)
 worker_mod.FIRST_CHECK_AFTER = timedelta(seconds=1)
+
+# «Популярные клипы» канала для Shorts: подставляются в шаге 10б, сами клипы настоящие
+CLIPS: list[dict] = []
+
+
+async def fake_popular_clips(http, channel, client):
+    return list(CLIPS)
+
+
+async def fake_client_id():
+    return "test-client"
+
+
+shorts_mod.popular_clips = fake_popular_clips
+shorts_mod.client_id = fake_client_id
+
+
+def clip_node(clip_id, slug, title, views, duration, game, vod=None, offset=None):
+    return {"id": clip_id, "slug": slug, "title": title, "viewCount": views, "durationSeconds": duration,
+            "createdAt": "2026-09-27T17:57:52Z", "curator": {"displayName": "viewer", "login": "viewer"},
+            "game": {"name": game}, "video": {"id": vod, "title": "Стрим"} if vod else None,
+            "videoOffsetSeconds": offset}
+
+
+async def ffprobe_dims(path):
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0",
+        str(path), stdout=asyncio.subprocess.PIPE)
+    out, _ = await proc.communicate()
+    width, height = out.decode().strip().split(",")[:2]
+    return int(width), int(height)
+
 
 RESULTS: list[tuple[bool, str]] = []
 
@@ -671,7 +705,7 @@ async def main():
     reply = await say("/youtube")
     consent = reply[-1][0]
     text = tg.messages[consent]["text"]
-    check("приватными роликами" in text and "плейлисты по категориям" in text and "политикой" in text
+    check("приватными роликами" in text and "плейлисты по категориям" in text and "Shorts" in text and "политикой" in text
           and "Условиями использования YouTube" in text and "/disconnect" in text and tg.find("ABCD-EFGH") is None,
           "до входа бот объясняет, что будет делать с каналом, и просит принять политику", text)
     await press(consent, "✅")
@@ -748,7 +782,7 @@ async def main():
     since = tg.next_message_id
     task = await start_app()
     policy = await wait_for(lambda: tg.find("Политика конфиденциальности AutoVOD обновлена", since), 30, "новая политика")
-    check("плейлисты по категориям" in tg.messages[policy]["text"]
+    check("плейлисты по категориям" in tg.messages[policy]["text"] and "Shorts" in tg.messages[policy]["text"]
           and buttons(tg.messages[policy]["markup"])[0] == "✅ Принимаю",
           "после обновления политики бот просит принять её заново", tg.messages[policy]["text"][:200])
 
@@ -921,6 +955,66 @@ async def main():
     _, err = await proc.communicate()
     check(not err.strip(), "полное декодирование этого ролика без ошибок", err[:300])
 
+    print("\n== 10б. Shorts из популярных клипов", flush=True)
+
+    async def shorts():
+        async with db() as s:
+            return list((await s.scalars(select(Segment).where(Segment.kind == SHORT).order_by(Segment.idx))).all())
+
+    async def shorts_sent(count):
+        rows = await shorts()
+        return rows if len(rows) >= count and all(r.tg_message_id for r in rows) else None
+
+    CLIPS[:] = [
+        clip_node("160495036", "MildObeseFlyKappaWealth-izDh89-5XKM_Na2S", "ААААААА ЖЕНЩИИНАА", 2037, 7,
+                  "Baldur's Gate 3", "2886356064", 5051),
+        clip_node("dup", "SameMomentClip", "тот же момент", 300, 10, "Baldur's Gate 3", "2886356064", 5053),
+        clip_node("series", "SeriesClip", "смотрим вместе", 500, 20, "Just Chatting", VOD_SERIES, 110),
+        clip_node("349032338", "AuspiciousPhilanthropicDragonflyThisIsSparta-mC4F6DJoEO3koY8K", "123123", 400, 15,
+                  "Portal 2"),
+        clip_node("141133624", "WealthyCooperativeTofuYee-5YHUOP3GWT0BPnk1", "куб компаньён", 153, 14, "Portal 2",
+                  "2885498731", 14305),
+        clip_node("low", "LowViewsClip", "мало просмотров", 50, 10, "Portal 2", "2885498731", 100),
+    ]
+    APPS[-1].shorts_wake.set()
+    rows = await wait_for(lambda: shorts_sent(3), 60, "Shorts из клипов")
+    # Первый Shorts очередь может взять в загрузку раньше, чем тест прочитает статус
+    check([r.clip_id for r in rows] == ["160495036", "series", "349032338"]
+          and [r.status == Status.SKIPPED for r in rows] == [False, True, False],
+          "клипы от 100 просмотров по убыванию; повтор момента, сериал, слабый клип и клип сверх 2 в сутки не берутся",
+          [(r.clip_id, r.status, r.reason) for r in rows])
+    short_a, short_series, short_f = rows
+    check(short_a.title == "ААААААА ЖЕНЩИИНАА | Заквиель" and short_f.title == "Portal 2 | Заквиель",
+          "название Shorts — название клипа, а бессмысленное заменено категорией", (short_a.title, short_f.title))
+    check("во все тяжкие" in (short_series.reason or "")
+          and "⬆️ Всё равно загрузить" in buttons(tg.messages[short_series.tg_message_id]["markup"]),
+          "клип из просмотра сериала пропущен, загрузить его можно кнопкой", short_series.reason)
+    m = tg.messages[short_a.tg_message_id]
+    check("🎬 <b>Shorts</b>" in m["text"] and "просмотров на Twitch: 2037" in m["text"] and m["silent"]
+          and buttons(m["markup"])[0] == "▶️ Twitch", "в Telegram карточка Shorts без звука", m["text"])
+    row = await wait_for(lambda: status_in(short_a.id, finals), 300, "Shorts A")
+    row_f = await wait_for(lambda: status_in(short_f.id, finals), 300, "Shorts F")
+    check(row.status == Status.PUBLISHED and row_f.status == Status.PUBLISHED, "Shorts опубликованы сами",
+          (row.status, row.error, row_f.status, row_f.error))
+    for r in (row, row_f):
+        session = next(v for v in google.sessions.values() if v["title"] == r.title)
+        dims, probe = await ffprobe_dims(session["path"]), session["probe"]
+        check(dims == (1080, 1920) and probe["streams"] == ["audio", "video"] and not probe["errors"]
+              and abs(probe["duration"] - r.expected_duration) < 1.5,
+              f"{r.title}: вертикальный ролик {dims[0]}×{dims[1]}, {probe['duration']:.1f} с", (dims, probe))
+    meta = next(v["meta"] for v in google.sessions.values() if v["title"] == row.title)
+    description = meta["snippet"]["description"]
+    check("Клип на Twitch: https://clips.twitch.tv/MildObeseFlyKappaWealth-izDh89-5XKM_Na2S" in description
+          and "#shorts" in description and "shorts" in meta["snippet"]["tags"],
+          "в описании ссылка на клип и #shorts", meta["snippet"])
+    await wait_for(lambda: (google.playlist("Shorts")[1] or {}).get("items") == [row.youtube_id, row_f.youtube_id],
+                   30, "плейлист Shorts")
+    check(google.playlist("Shorts")[1]["title"] == "Shorts | Заквиель", "Shorts попали в свой плейлист «Shorts | Заквиель»")
+    APPS[-1].shorts_wake.set()
+    await asyncio.sleep(3)
+    check(len(await shorts()) == 3, "повторная проверка не берёт те же клипы и соблюдает лимит на сутки")
+    check(not list((WORK / "data" / "shorts").glob("*.mp4")), "после загрузки файлы Shorts удалены")
+
     print("\n== 11. Ежедневная сверка, отключение канала и отзыв доступа", flush=True)
 
     async def run_daily_check():
@@ -948,7 +1042,7 @@ async def main():
     check((await streamer_row()).youtube_channel_title == "Канал после переименования", "название канала обновлено")
     async with db() as s:
         stored = sorted(row.category for row in (await s.scalars(select(Playlist))).all())
-    check(stored == ["minecraft"], "плейлист, удалённый на YouTube, забыт при сверке", stored)
+    check(stored == ["minecraft", "shorts"], "плейлист, удалённый на YouTube, забыт при сверке", stored)
     await wait_for(lambda: (google.playlist("Minecraft")[1] or {}).get("items", [])[-1:] == [video[w_mc.id]], 30,
                    "W.MC в плейлисте")
     check(True, "ролик, открытый в Studio, тоже попал в плейлист своей категории")
@@ -1001,7 +1095,8 @@ async def main():
     check(set(tg.calls) <= FakeTelegram.KNOWN, "бот не вызывает неожиданных методов Telegram")
     check(all(u["status"].get("containsSyntheticMedia") is False for u in google.updates), "при публикации status полный")
     await crash(task)
-    leftovers = [p.name for p in (WORK / "data").iterdir() if p.suffix not in (".db", ".db-wal", ".db-shm")]
+    leftovers = [p.name for p in (WORK / "data").iterdir()
+                 if p.suffix not in (".db", ".db-wal", ".db-shm") and not (p.is_dir() and not any(p.iterdir()))]
     check(not leftovers, "на диске ничего, кроме базы", leftovers)
     print(f"   пиковая память процесса: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.0f} МБ")
 

@@ -1,8 +1,8 @@
-"""Состояние канала Twitch одним запросом к GraphQL: идёт ли стрим и как он называется.
+"""Запросы к GraphQL Twitch: идёт ли стрим и как он называется, популярные клипы канала.
 
-Запрос лёгкий (десятки миллисекунд), поэтому его можно делать раз в минуту, пока идёт
-стрим. ID клиента берётся из установленного yt-dlp: Twitch его иногда меняет, а yt-dlp
-обновляется раз в сутки.
+Запросы лёгкие (десятки миллисекунд), поэтому название можно спрашивать раз в минуту,
+пока идёт стрим. ID клиента берётся из установленного yt-dlp: Twitch его иногда меняет,
+а yt-dlp обновляется раз в сутки.
 """
 
 from __future__ import annotations
@@ -20,6 +20,12 @@ GQL_URL = "https://gql.twitch.tv/gql"
 # Если yt-dlp не ответил: значение из yt-dlp 2026.09
 FALLBACK_CLIENT_ID = "ue6666qo983tsx6so1t0vnawi233wa"
 QUERY = "query($login: String!) { user(login: $login) { stream { id createdAt } broadcastSettings { title } } }"
+# Клипы за последние 7 дней, самые просматриваемые первыми
+CLIPS_QUERY = (
+    "query($login: String!) { user(login: $login) { clips(first: 50, criteria: {period: LAST_WEEK, sort: VIEWS_DESC}) "
+    "{ edges { node { id slug title viewCount durationSeconds createdAt curator { displayName login } "
+    "game { name } video { id title } videoOffsetSeconds } } } } }"
+)
 
 
 class TwitchError(RuntimeError):
@@ -44,12 +50,12 @@ async def client_id() -> str:
     return value if status == 0 and value.isalnum() else FALLBACK_CLIENT_ID
 
 
-async def live_state(http: httpx.AsyncClient, channel: str, client: str) -> LiveState | None:
-    """Текущий стрим канала или None, если стрима нет."""
+async def _user(http: httpx.AsyncClient, query: str, channel: str, client: str) -> dict:
+    """Ответ GraphQL на запрос про канал: объект user."""
     try:
         resp = await http.post(
             GQL_URL,
-            content=json.dumps({"query": QUERY, "variables": {"login": channel}}),
+            content=json.dumps({"query": query, "variables": {"login": channel}}),
             headers={"Client-ID": client, "Content-Type": "text/plain;charset=UTF-8"},
             timeout=20,
         )
@@ -65,6 +71,18 @@ async def live_state(http: httpx.AsyncClient, channel: str, client: str) -> Live
     user = (data.get("data") or {}).get("user")
     if user is None:
         raise TwitchError(f"канала {channel} нет на Twitch")
+    return user
+
+
+async def popular_clips(http: httpx.AsyncClient, channel: str, client: str) -> list[dict]:
+    """Клипы канала за последние 7 дней, самые просматриваемые первыми (сырые объекты GraphQL)."""
+    user = await _user(http, CLIPS_QUERY, channel, client)
+    return [edge["node"] for edge in ((user.get("clips") or {}).get("edges") or []) if edge.get("node")]
+
+
+async def live_state(http: httpx.AsyncClient, channel: str, client: str) -> LiveState | None:
+    """Текущий стрим канала или None, если стрима нет."""
+    user = await _user(http, QUERY, channel, client)
     stream = user.get("stream")
     if not stream:
         return None

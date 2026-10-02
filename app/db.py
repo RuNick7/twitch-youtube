@@ -62,11 +62,32 @@ class Vod(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
+SHORT = "short"  # Segment.kind: вертикальный ролик из клипа Twitch
+
+
+def clips_vod_id(login: str) -> str:
+    """Shorts живут в той же таблице, что сегменты, и с тем же жизненным циклом на YouTube.
+
+    Их «VOD» — служебная запись clips-<логин>: у клипа запись эфира может быть не обработана
+    или удалена, а настоящий ID VOD нельзя занимать, иначе бот решит, что эфир уже нарезан.
+    """
+    return f"clips-{login.lower()}"
+
+
 class Segment(Base):
     __tablename__ = "segments"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     vod_id: Mapped[str] = mapped_column(ForeignKey("vods.id"), index=True)
+    kind: Mapped[str | None] = mapped_column(String(16))  # None — сегмент VOD, SHORT — Shorts из клипа
+    # Только у Shorts: клип Twitch, из которого сделан ролик
+    clip_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    clip_slug: Mapped[str | None] = mapped_column(String(128))
+    clip_title: Mapped[str | None] = mapped_column(Text)
+    clip_views: Mapped[int | None]
+    clip_author: Mapped[str | None] = mapped_column(String(128))
+    clip_vod_id: Mapped[str | None] = mapped_column(String(32))  # запись эфира, если она есть
+    clip_created_at: Mapped[datetime | None]
     idx: Mapped[int]
     start: Mapped[int]
     end: Mapped[int]
@@ -195,6 +216,16 @@ async def get_streamer(session: AsyncSession, login: str) -> Streamer:
         session.add(streamer)
         await session.flush()
     return streamer
+
+
+async def get_clips_vod(session: AsyncSession, streamer: Streamer) -> Vod:
+    """Служебная запись, к которой привязаны Shorts стримера (см. clips_vod_id)."""
+    vod = await session.get(Vod, clips_vod_id(streamer.login))
+    if vod is None:
+        vod = Vod(id=clips_vod_id(streamer.login), streamer_id=streamer.id, title="Клипы канала", duration=0)
+        session.add(vod)
+        await session.flush()
+    return vod
 
 
 async def kv_get(session: AsyncSession, key: str) -> str | None:

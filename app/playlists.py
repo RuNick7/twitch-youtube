@@ -1,7 +1,7 @@
 """Плейлисты по категориям: опубликованный ролик добавляется в плейлист своей категории.
 
-Плейлист создаётся при первом опубликованном ролике категории. Если его удалили
-на YouTube, бот создаёт новый при следующем ролике.
+У Shorts свой плейлист «Shorts | <стример>». Плейлист создаётся при первом опубликованном
+ролике категории. Если его удалили на YouTube, бот создаёт новый при следующем ролике.
 """
 
 from __future__ import annotations
@@ -13,15 +13,16 @@ from html import escape
 import httpx
 from sqlalchemy import delete, select
 
-from .consent import CONSENT_VERSION, accepted_version
+from .consent import PLAYLISTS_SINCE, accepted_version
 from .context import App
-from .db import Playlist, Segment, Status, Streamer, Vod, utcnow
+from .db import SHORT, Playlist, Segment, Status, Streamer, Vod, utcnow
 from .segments import build_playlist_title, category_key
 from .service import update_segment
 from .youtube import LIMIT_REASONS, AuthError, YouTubeError
 
 log = logging.getLogger(__name__)
 
+SHORTS_PLAYLIST = "Shorts"
 _lock = asyncio.Lock()
 
 
@@ -30,7 +31,7 @@ async def sync_playlists(app: App) -> None:
     if not app.settings.playlists or _lock.locked():
         return
     async with _lock:
-        if await accepted_version(app) < CONSENT_VERSION:
+        if await accepted_version(app) < PLAYLISTS_SINCE:
             return  # владелец ещё не принял политику, где описаны плейлисты
         async with app.sessions() as session:
             streamers = list((await session.scalars(select(Streamer).where(Streamer.youtube_token.is_not(None)))).all())
@@ -61,10 +62,11 @@ async def _sync(app: App, streamer: Streamer) -> None:
             for row in (await session.scalars(select(Playlist).where(Playlist.streamer_id == streamer.id))).all()
         }
     for seg in pending:
-        key = category_key(seg.category)
+        category = SHORTS_PLAYLIST if seg.kind == SHORT else seg.category
+        key = category_key(category)
         try:
             if key not in playlists:
-                playlists[key] = await _create(app, streamer, token, seg.category, key)
+                playlists[key] = await _create(app, streamer, token, category, key)
             try:
                 await app.youtube.add_to_playlist(token, playlists[key], seg.youtube_id)
             except YouTubeError as exc:
@@ -72,7 +74,7 @@ async def _sync(app: App, streamer: Streamer) -> None:
                     raise
                 # Плейлист удалили на YouTube: создаём новый
                 await _forget(app, streamer, key)
-                playlists[key] = await _create(app, streamer, token, seg.category, key)
+                playlists[key] = await _create(app, streamer, token, category, key)
                 await app.youtube.add_to_playlist(token, playlists[key], seg.youtube_id)
         except AuthError:
             return  # отзывом доступа занимается ежедневная сверка
@@ -90,10 +92,14 @@ async def _sync(app: App, streamer: Streamer) -> None:
 async def _create(app: App, streamer: Streamer, token: str, category: str, key: str) -> str:
     settings = app.settings
     name = settings.streamer_name or streamer.display_name or streamer.login
+    if category == SHORTS_PLAYLIST:
+        what = f"Shorts из клипов стримов {name}"
+    else:
+        what = f"Все ролики категории «{category}» со стримов {name}"
     playlist_id = await app.youtube.create_playlist(
         token,
         build_playlist_title(category, name),
-        f"Все ролики категории «{category}» со стримов {name}. Twitch: https://www.twitch.tv/{streamer.login}",
+        f"{what}. Twitch: https://www.twitch.tv/{streamer.login}",
         settings.publish_privacy,
     )
     async with app.sessions() as session, session.begin():

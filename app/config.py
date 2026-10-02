@@ -46,6 +46,13 @@ class Settings(BaseSettings):
     # Плейлист на каждую категорию: опубликованный ролик добавляется в плейлист своей категории
     playlists: bool = True
 
+    # Shorts из популярных клипов канала за последние 7 дней: от shorts_min_views просмотров
+    # на Twitch, не больше shorts_per_day за сутки; список клипов проверяется раз в shorts_check_min минут
+    shorts: bool = True
+    shorts_min_views: int = 100
+    shorts_per_day: int = 2
+    shorts_check_min: int = 60
+
     # Политика конфиденциальности и условия использования: бот показывает их перед подключением канала.
     # Своя копия бота публикуется со своими страницами
     privacy_url: str = "https://runick7.github.io/twitch-youtube/privacy.html"
