@@ -78,12 +78,10 @@ async def main() -> None:
         app.spawn(Worker(app).run())
         app.spawn(Checker(app).run())
         app.spawn(Refresher(app).run())
-        if settings.shorts:
-            app.spawn(ShortsScout(app).run())
+        # Shorts можно включить отдельному стримеру, поэтому клипы проверяются всегда
+        app.spawn(ShortsScout(app).run())
         if settings.watch_interval_sec > 0:
             app.spawn(Watcher(app).run())
-        else:
-            app.watch_state = "слежение выключено (WATCH_INTERVAL_SEC=0), только /process"
         if settings.title_poll_sec > 0:
             app.spawn(TitleTracker(app).run())
         app.spawn(keep_ytdlp_fresh(app))

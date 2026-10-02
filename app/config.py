@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import json
+import logging
+from functools import lru_cache
 from pathlib import Path
 from typing import List, Literal
 
+from pydantic import TypeAdapter, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .segments import split_list
+
+log = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -108,3 +114,57 @@ class Settings(BaseSettings):
     @property
     def unnumbered_categories(self) -> List[str]:
         return split_list(self.no_part_categories)
+
+
+# Настройки, которые можно задать стримеру отдельно (Streamer.overrides). Остальные общие для всех стримеров
+STREAMER_FIELDS = (
+    "auto_publish",
+    "publish_privacy",
+    "publish_delay_min",
+    "monitor_days",
+    "youtube_language",
+    "youtube_category_id",
+    "playlists",
+    "shorts",
+    "shorts_min_views",
+    "shorts_per_day",
+    "shorts_publish_delay_min",
+    "min_segment_sec",
+    "skip_shorter_min",
+    "join_repeated",
+    "no_part_categories",
+    "skip_title_keywords",
+    "skip_title_categories",
+    "skip_categories",
+    "warn_categories",
+)
+_ADAPTERS = {name: TypeAdapter(Settings.model_fields[name].annotation) for name in STREAMER_FIELDS}
+
+
+def streamer_settings(settings: Settings, overrides: str | None) -> Settings:
+    """Настройки стримера: общие из .env, а поверх — его отличия (JSON из Streamer.overrides)."""
+    values = dict(_parse_overrides(overrides)) if overrides else {}
+    return settings.model_copy(update=values) if values else settings
+
+
+@lru_cache(maxsize=64)
+def _parse_overrides(text: str) -> tuple[tuple[str, object], ...]:
+    """Проверенные отличия. Неизвестные настройки и неверные значения пропускаются с предупреждением в логе."""
+    try:
+        raw = json.loads(text)
+    except ValueError:
+        raw = None
+    if not isinstance(raw, dict):
+        log.warning("Настройки стримера — не объект JSON: %s", text[:200])
+        return ()
+    values = []
+    for key, value in raw.items():
+        adapter = _ADAPTERS.get(key)
+        if adapter is None:
+            log.warning("Настройку %s нельзя задать стримеру отдельно", key)
+            continue
+        try:
+            values.append((key, adapter.validate_python(value)))
+        except ValidationError as exc:
+            log.warning("Неверное значение настройки стримера %s=%r: %s", key, value, exc.errors()[0]["msg"])
+    return tuple(values)

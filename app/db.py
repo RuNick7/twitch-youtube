@@ -49,6 +49,8 @@ class Streamer(Base):
     display_name: Mapped[str | None] = mapped_column(String(128))  # название канала на Twitch
     # Имя в конце названий роликов и плейлистов — так стримера ищут зрители («Заквиель»)
     title_name: Mapped[str | None] = mapped_column(String(128))
+    # Настройки стримера, которые отличаются от .env: JSON {"shorts_min_views": 300, …}, см. config.STREAMER_FIELDS
+    overrides: Mapped[str | None] = mapped_column(Text)
     paused: Mapped[bool | None]  # загрузка и публикация остановлены: /pause или пропал доступ к YouTube
     watch_since: Mapped[datetime | None]  # эфиры, закончившиеся раньше, слежение не трогает
     youtube_channel_id: Mapped[str | None] = mapped_column(String(64))
@@ -225,6 +227,14 @@ def _add_missing_columns(conn) -> None:
 
 async def find_streamer(session: AsyncSession, login: str) -> Streamer | None:
     return await session.scalar(select(Streamer).where(Streamer.login == login.lower()))
+
+
+async def all_streamers(session: AsyncSession, connected: bool = False) -> list[Streamer]:
+    """Все стримеры в порядке добавления; connected — только с подключённым YouTube-каналом."""
+    query = select(Streamer).order_by(Streamer.id)
+    if connected:
+        query = query.where(Streamer.youtube_token.is_not(None))
+    return list((await session.scalars(query)).all())
 
 
 async def get_streamer(session: AsyncSession, login: str) -> Streamer:

@@ -1,8 +1,8 @@
-"""Слежение за каналом: после конца стрима VOD сам уходит в обработку.
+"""Слежение за каналами стримеров: после конца стрима VOD сам уходит в обработку.
 
 Ключи Twitch API не нужны: список записей эфиров и признак «идёт сейчас» берутся
-через yt-dlp — тот же источник, откуда берутся главы и плейлист. Название стрима
-во время эфира — лёгким запросом к GraphQL Twitch (см. twitch.py).
+через yt-dlp — тот же источник, откуда берутся главы и плейлист. Названия идущих
+стримов — одним лёгким запросом к GraphQL Twitch на всех стримеров (см. twitch.py).
 """
 
 from __future__ import annotations
@@ -12,13 +12,13 @@ import logging
 from datetime import datetime, timedelta
 from html import escape
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from .context import App
-from .db import TitleChange, Vod, as_utc, get_streamer, utcnow
+from .db import Streamer, TitleChange, Vod, all_streamers, as_utc, utcnow
 from .service import IngestError, ingest_vod
 from .tools import fetch_vod_info, list_channel_vods
-from .twitch import client_id, live_state
+from .twitch import LiveState, client_id, live_states
 from .ui import local_time
 
 log = logging.getLogger(__name__)
@@ -28,41 +28,52 @@ TITLE_ALERT_AFTER_FAILURES = 10
 
 
 class Watcher:
+    """Проверяет каналы всех стримеров по очереди."""
+
     def __init__(self, app: App):
         self.app = app
         self.done: set[str] = set()  # уже обработаны или закончились до начала слежения
-        self.failures = 0
+        self.failures: dict[int, int] = {}  # ошибок подряд по ID стримера
 
     async def run(self) -> None:
-        since = await self._since()
         while True:
-            try:
-                await self.tick(since)
-                self.failures = 0
-            except Exception as exc:
-                self.failures += 1
-                log.warning("Не удалось проверить канал: %s", exc)
-                self.app.watch_state = f"ошибка проверки: {escape(str(exc)[:200])}"
-                if self.failures == ALERT_AFTER_FAILURES:
-                    await self.app.notify(
-                        f"🔴 Не получается проверить канал Twitch {ALERT_AFTER_FAILURES} раза подряд: "
-                        f"{escape(str(exc)[:300])}"
-                    )
+            async with self.app.sessions() as session:
+                streamers = await all_streamers(session)
+            for streamer in streamers:
+                await self._check(streamer)
             await asyncio.sleep(self.app.settings.watch_interval_sec)
 
-    async def _since(self) -> datetime:
-        """С какого момента следим. Эфиры, закончившиеся раньше, не трогаем: их можно отдать через /process."""
-        async with self.app.sessions() as session, session.begin():
-            streamer = await get_streamer(session, self.app.settings.twitch_channel)
-            if streamer.watch_since is None:
-                streamer.watch_since = utcnow()
-            return as_utc(streamer.watch_since)
+    async def _check(self, streamer: Streamer) -> None:
+        """Сбой на одном канале не мешает проверить остальные."""
+        try:
+            await self.tick(streamer)
+            self.failures[streamer.id] = 0
+        except Exception as exc:
+            failures = self.failures[streamer.id] = self.failures.get(streamer.id, 0) + 1
+            log.warning("Не удалось проверить канал %s: %s", streamer.login, exc)
+            self.app.watch_states[streamer.id] = f"ошибка проверки: {escape(str(exc)[:200])}"
+            if failures == ALERT_AFTER_FAILURES:
+                await self.app.notify(
+                    f"🔴 Не получается проверить канал Twitch {escape(streamer.login)} {ALERT_AFTER_FAILURES} раза "
+                    f"подряд: {escape(str(exc)[:300])}"
+                )
 
-    async def tick(self, since: datetime) -> None:
+    async def _since(self, streamer: Streamer) -> datetime:
+        """С какого момента следим за каналом. Эфиры, закончившиеся раньше, не трогаем: их можно отдать через /process."""
+        if streamer.watch_since is None:
+            streamer.watch_since = utcnow()
+            async with self.app.sessions() as session, session.begin():
+                await session.execute(
+                    update(Streamer).where(Streamer.id == streamer.id).values(watch_since=streamer.watch_since)
+                )
+        return as_utc(streamer.watch_since)
+
+    async def tick(self, streamer: Streamer) -> None:
         app = self.app
+        since = await self._since(streamer)
         grace = timedelta(minutes=app.settings.watch_grace_min)
         live = waiting = None
-        for vod_id in reversed(await list_channel_vods(app.settings.twitch_channel)):
+        for vod_id in reversed(await list_channel_vods(streamer.login)):
             if vod_id in self.done:
                 continue
             async with app.sessions() as session:
@@ -80,29 +91,33 @@ class Watcher:
             if utcnow() - ended < grace:
                 waiting = ended  # вдруг стример переподключится
                 continue
-            log.info("Стрим закончился, обрабатываю VOD %s", vod_id)
+            log.info("Стрим %s закончился, обрабатываю VOD %s", streamer.login, vod_id)
             try:
-                await ingest_vod(app, info)
+                await ingest_vod(app, info, streamer.login)
             except IngestError as exc:
                 log.warning("VOD %s не обработан: %s", vod_id, exc)
             self.done.add(vod_id)
 
         checked = local_time(utcnow(), app.tz, "%H:%M")
         if live:
-            app.watch_state = f"идёт стрим «{escape(live.title)}», проверено в {checked}"
+            state = f"идёт стрим «{escape(live.title)}», проверено в {checked}"
         elif waiting:
-            app.watch_state = f"стрим закончился, жду {app.settings.watch_grace_min} мин на случай переподключения"
+            state = f"стрим закончился, жду {app.settings.watch_grace_min} мин на случай переподключения"
         else:
-            app.watch_state = f"стрима нет, проверено в {checked}"
+            state = f"стрима нет, проверено в {checked}"
+        app.watch_states[streamer.id] = state
 
 
 class TitleTracker:
-    """Пока идёт стрим, записывает смены его названия: в данных VOD их нет, а это граница сегмента."""
+    """Пока идёт стрим, записывает смены его названия: в данных VOD их нет, а это граница сегмента.
+
+    Про всех стримеров Twitch спрашивается одним запросом.
+    """
 
     def __init__(self, app: App):
         self.app = app
         self.client: str | None = None
-        self.last: tuple[str, str] | None = None  # (ID стрима, название), уже записанные в базу
+        self.last: dict[int, tuple[str, str]] = {}  # ID стримера → (ID стрима, название), уже записанные в базу
         self.failures = 0
 
     async def run(self) -> None:
@@ -113,7 +128,7 @@ class TitleTracker:
             except Exception as exc:
                 self.failures += 1
                 self.client = None  # вдруг Twitch сменил ID клиента: возьмём свежий у yt-dlp
-                log.warning("Не удалось узнать название стрима: %s", exc)
+                log.warning("Не удалось узнать названия стримов: %s", exc)
                 if self.failures == TITLE_ALERT_AFTER_FAILURES:
                     await self.app.notify(
                         f"🟡 Не получается узнать название стрима {TITLE_ALERT_AFTER_FAILURES} раз подряд: "
@@ -124,16 +139,23 @@ class TitleTracker:
     async def tick(self) -> None:
         if self.client is None:
             self.client = await client_id()
-        channel = self.app.settings.twitch_channel.lower()
-        state = await live_state(self.app.http, channel, self.client)
+        async with self.app.sessions() as session:
+            streamers = await all_streamers(session)
+        states = await live_states(self.app.http, [streamer.login for streamer in streamers], self.client)
+        for streamer in streamers:
+            await self._track(streamer, states.get(streamer.login))
+
+    async def _track(self, streamer: Streamer, state: LiveState | None) -> None:
+        app = self.app
         if state is None:
-            self.last = None
-            self.app.live_title = None
+            self.last.pop(streamer.id, None)
+            app.live_titles.pop(streamer.id, None)
             return
-        self.app.live_title = state.title
-        if self.last == (state.stream_id, state.title):
+        app.live_titles[streamer.id] = state.title
+        if self.last.get(streamer.id) == (state.stream_id, state.title):
             return
-        async with self.app.sessions() as session, session.begin():
+        channel = streamer.login
+        async with app.sessions() as session, session.begin():
             previous = await session.scalar(
                 select(TitleChange)
                 .where(TitleChange.channel == channel, TitleChange.stream_id == state.stream_id)
@@ -150,5 +172,5 @@ class TitleTracker:
                         title=state.title,
                     )
                 )
-                log.info("Название стрима: %s", state.title)
-        self.last = (state.stream_id, state.title)
+                log.info("Название стрима %s: %s", channel, state.title)
+        self.last[streamer.id] = (state.stream_id, state.title)

@@ -47,10 +47,10 @@ async def prompt_update(app: App) -> None:
     accepted = accepted_version(streamer)
     if accepted >= CONSENT_VERSION:
         return
-    name = streamer.display_name or app.settings.twitch_channel
+    name = streamer.display_name or streamer.login
     changes = [text for version, text in sorted(CHANGES.items()) if version > accepted]
     message = await app.notify(
-        render_consent(app.settings, name, changes=changes),
+        render_consent(app.config(streamer), name, changes=changes),
         markup=confirm_keyboard("✅ Принимаю", accept_action(CONSENT_VERSION)),
     )
     if message:

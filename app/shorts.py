@@ -18,6 +18,7 @@ from typing import AsyncGenerator
 from sqlalchemy import func, select
 
 from .clips import Clip, build_short_description, build_short_title, choose, clip_url, parse_clip
+from .config import Settings
 from .consent import SHORTS_SINCE, accepted_version
 from .context import App
 from .db import (
@@ -26,8 +27,9 @@ from .db import (
     Status,
     Streamer,
     TitleChange,
+    all_streamers,
+    clips_vod_id,
     dump_warnings,
-    find_streamer,
     get_clips_vod,
     get_spans,
     utcnow,
@@ -58,7 +60,7 @@ def shorts_dir(app: App) -> Path:
 
 
 class ShortsScout:
-    """Следит за клипами канала и ставит в очередь новые Shorts."""
+    """Следит за клипами каналов всех стримеров и ставит в очередь новые Shorts по их настройкам."""
 
     def __init__(self, app: App):
         self.app = app
@@ -79,27 +81,41 @@ class ShortsScout:
                 pass
 
     async def scan(self) -> int:
-        """Ставит в очередь новые клипы и возвращает, сколько Shorts добавлено (вместе с пропущенными)."""
-        app, settings = self.app, self.app.settings
-        if not settings.shorts:
-            return 0
+        """Ставит в очередь новые клипы всех стримеров и возвращает, сколько Shorts добавлено (вместе с пропущенными)."""
+        app = self.app
         async with app.sessions() as session:
-            streamer = await find_streamer(session, settings.twitch_channel)
-            if streamer is None or accepted_version(streamer) < SHORTS_SINCE:
-                return 0  # владелец канала ещё не принял политику, где описаны Shorts
+            streamers = await all_streamers(session, connected=True)
             stored = list((await session.scalars(select(Segment).where(Segment.kind == SHORT))).all())
+        self._clean_files(stored)
+        added = 0
+        for streamer in streamers:
+            settings = app.config(streamer)
+            # Пока владелец канала не принял политику, где описаны Shorts, бот их не делает
+            if not settings.shorts or accepted_version(streamer) < SHORTS_SINCE:
+                continue
+            try:
+                added += await self._scan(streamer, settings)
+            except Exception:
+                self.client = None  # вдруг Twitch сменил ID клиента: возьмём свежий у yt-dlp
+                log.exception("Не удалось проверить клипы канала %s", streamer.login)
+        if added:
+            app.wake.set()
+        return added
+
+    async def _scan(self, streamer: Streamer, settings: Settings) -> int:
+        app = self.app
+        clips_vod = clips_vod_id(streamer.login)
+        async with app.sessions() as session:
+            stored = list((await session.scalars(select(Segment).where(Segment.vod_id == clips_vod))).all())
             recent = await session.scalar(
                 select(func.count())
                 .select_from(Segment)
                 .where(
-                    Segment.kind == SHORT,
+                    Segment.vod_id == clips_vod,
                     Segment.status != Status.SKIPPED,
                     Segment.queued_at >= utcnow() - timedelta(days=1),
                 )
             )
-        self._clean_files(stored)
-        if not streamer.youtube_token:
-            return 0
         if self.client is None:
             self.client = await client_id()
         clips = [clip for clip in map(parse_clip, await popular_clips(app.http, streamer.login, self.client)) if clip]
@@ -107,15 +123,13 @@ class ShortsScout:
         added = 0
         for clip in choose(clips, settings.shorts_min_views, [_stored_clip(row) for row in stored]):
             stream_title, covering = await self._context(streamer, clip)
-            reason = self._skip_reason(clip, stream_title, covering)
+            reason = self._skip_reason(settings, clip, stream_title, covering)
             if reason is None:
                 if room <= 0:
                     continue  # лимит на сутки: клип дождётся следующей проверки
                 room -= 1
-            await self._add(streamer, clip, stream_title, reason)
+            await self._add(streamer, settings, clip, stream_title, reason)
             added += 1
-        if added:
-            app.wake.set()
         return added
 
     async def _context(self, streamer: Streamer, clip: Clip) -> tuple[str | None, Segment | None]:
@@ -144,11 +158,12 @@ class ShortsScout:
         title = (covering.stream_title if covering else None) or (change.title if change else None) or clip.vod_title
         return title, covering
 
-    def _skip_reason(self, clip: Clip, stream_title: str | None, covering: Segment | None) -> str | None:
+    def _skip_reason(
+        self, settings: Settings, clip: Clip, stream_title: str | None, covering: Segment | None
+    ) -> str | None:
         """Те же фильтры, что для сегментов: клипы из сериалов и фильмов не загружаются."""
         if covering is not None and covering.status == Status.SKIPPED and not is_short_reason(covering.reason):
             return f"клип из части стрима, которая не загружается: {covering.reason}"
-        settings = self.app.settings
         return skip_reason(
             clip.category or FALLBACK_CATEGORY,
             " ".join(text for text in (stream_title, clip.vod_title, clip.title) if text),
@@ -157,8 +172,10 @@ class ShortsScout:
             categories=settings.skipped_categories,
         )
 
-    async def _add(self, streamer: Streamer, clip: Clip, stream_title: str | None, reason: str | None) -> None:
-        app, settings = self.app, self.app.settings
+    async def _add(
+        self, streamer: Streamer, settings: Settings, clip: Clip, stream_title: str | None, reason: str | None
+    ) -> None:
+        app = self.app
         name = streamer.public_name
         category = clip.category or FALLBACK_CATEGORY
         start, end = clip.span or (0, max(1, round(clip.duration)))
@@ -288,7 +305,7 @@ async def short_metadata(app: App, seg: Segment, streamer: Streamer) -> dict:
         ),
         "tags": build_tags(seg.category, streamer.title_name, name, streamer.login, "shorts", "клип", "twitch"),
     }
-    return video_metadata(app, snippet)
+    return video_metadata(app.config(streamer), snippet)
 
 
 async def prepare_short(app: App, seg: Segment) -> Path:

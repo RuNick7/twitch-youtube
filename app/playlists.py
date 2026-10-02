@@ -15,7 +15,7 @@ from sqlalchemy import delete, select
 
 from .consent import PLAYLISTS_SINCE, accepted_version
 from .context import App
-from .db import SHORT, Playlist, Segment, Status, Streamer, Vod, utcnow
+from .db import SHORT, Playlist, Segment, Status, Streamer, Vod, all_streamers, utcnow
 from .segments import build_playlist_title, category_key
 from .service import update_segment
 from .youtube import LIMIT_REASONS, AuthError, YouTubeError
@@ -28,14 +28,14 @@ _lock = asyncio.Lock()
 
 async def sync_playlists(app: App) -> None:
     """Добавляет в плейлисты опубликованные ролики, которых там ещё нет."""
-    if not app.settings.playlists or _lock.locked():
+    if _lock.locked():
         return
     async with _lock:
         async with app.sessions() as session:
-            streamers = list((await session.scalars(select(Streamer).where(Streamer.youtube_token.is_not(None)))).all())
+            streamers = await all_streamers(session, connected=True)
         for streamer in streamers:
             # Пока владелец канала не принял политику, где описаны плейлисты, бот их не трогает
-            if accepted_version(streamer) >= PLAYLISTS_SINCE:
+            if app.config(streamer).playlists and accepted_version(streamer) >= PLAYLISTS_SINCE:
                 await _sync(app, streamer)
 
 
@@ -90,7 +90,7 @@ async def _sync(app: App, streamer: Streamer) -> None:
 
 
 async def _create(app: App, streamer: Streamer, token: str, category: str, key: str) -> str:
-    settings = app.settings
+    settings = app.config(streamer)
     name = streamer.public_name
     if category == SHORTS_PLAYLIST:
         what = f"Shorts из клипов стримов {name}"

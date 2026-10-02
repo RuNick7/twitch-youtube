@@ -139,12 +139,11 @@ async def connect_youtube(message: Message, app: App) -> None:
     if not (app.settings.google_client_id and app.settings.google_client_secret):
         await message.answer("Сначала заполните GOOGLE_CLIENT_ID и GOOGLE_CLIENT_SECRET в .env и перезапустите контейнер.")
         return
-    async with app.sessions() as session:
-        streamer = await find_streamer(session, app.settings.twitch_channel)
-    name = (streamer.display_name if streamer else None) or app.settings.twitch_channel
+    streamer = await _streamer(app)
     # Вход только после согласия: так требуют правила YouTube API
     await message.answer(
-        render_consent(app.settings, name), reply_markup=confirm_keyboard("✅ Принимаю, подключить", CONNECT)
+        render_consent(app.config(streamer), streamer.display_name or streamer.login),
+        reply_markup=confirm_keyboard("✅ Принимаю, подключить", CONNECT),
     )
 
 
@@ -263,25 +262,26 @@ async def _drop_buttons(query: CallbackQuery) -> None:
 async def show_status(message: Message, app: App) -> None:
     counts = await status_counts(app)
     short_counts = await status_counts(app, SHORT)
-    async with app.sessions() as session:
-        streamer = await find_streamer(session, app.settings.twitch_channel)
+    streamer = await _streamer(app)
     youtube = (
-        f"«{escape(streamer.youtube_channel_title or '')}»"
-        if streamer and streamer.youtube_token
-        else "не подключён, выполните /youtube"
+        f"«{escape(streamer.youtube_channel_title or '')}»" if streamer.youtube_token else "не подключён, выполните /youtube"
     )
     segments = ", ".join(f"{label} {counts[key]}" for key, label in STATUS_LABELS if counts.get(key))
     shorts_done = ", ".join(f"{label} {short_counts[key]}" for key, label in STATUS_LABELS if short_counts.get(key))
     disk = shutil.disk_usage(app.settings.data_dir)
-    paused = bool(streamer and streamer.paused)
-    wait_until = streamer.uploads_wait_until if streamer else None
+    wait_until = streamer.uploads_wait_until
     waiting = (
         f"Загрузка: ⏳ YouTube не принимает новые ролики — {limits.describe(streamer.uploads_wait_reason)}. "
         f"Следующая попытка в {local_time(wait_until, app.tz, '%H:%M')}, публикация идёт как обычно"
         if wait_until and as_utc(wait_until) > utcnow()
         else None
     )
-    settings = app.settings
+    if app.settings.watch_interval_sec <= 0:
+        watch = "слежение выключено (WATCH_INTERVAL_SEC=0), только /process"
+    else:
+        watch = app.watch_states.get(streamer.id, "ещё не проверялся")
+    live_title = app.live_titles.get(streamer.id)
+    settings = app.config(streamer)
     publishing = (
         f"{PUBLISH_PLACES[settings.publish_privacy]} через {settings.publish_delay_min} мин после обработки"
         if settings.auto_publish
@@ -291,7 +291,7 @@ async def show_status(message: Message, app: App) -> None:
         playlist_count = await session.scalar(select(func.count()).select_from(Playlist))
     if not settings.playlists:
         playlists = "выключены (PLAYLISTS=false)"
-    elif not (streamer and streamer.youtube_token):
+    elif not streamer.youtube_token:
         playlists = "YouTube-канал не подключён"
     elif consent.accepted_version(streamer) < consent.PLAYLISTS_SINCE:
         playlists = "ждут согласия с обновлённой политикой конфиденциальности"
@@ -299,7 +299,7 @@ async def show_status(message: Message, app: App) -> None:
         playlists = f"по категориям, создано {playlist_count}"
     if not settings.shorts:
         shorts = "выключены (SHORTS=false)"
-    elif not (streamer and streamer.youtube_token):
+    elif not streamer.youtube_token:
         shorts = "YouTube-канал не подключён"
     elif consent.accepted_version(streamer) < consent.SHORTS_SINCE:
         shorts = "ждут согласия с обновлённой политикой конфиденциальности"
@@ -312,10 +312,10 @@ async def show_status(message: Message, app: App) -> None:
     await message.answer(
         "\n".join(
             [
-                f"Twitch: {escape(app.settings.twitch_channel)} — {app.watch_state}",
-                *([f"Название стрима сейчас: «{escape(app.live_title)}»"] if app.live_title else []),
+                f"Twitch: {escape(streamer.login)} — {watch}",
+                *([f"Название стрима сейчас: «{escape(live_title)}»"] if live_title else []),
                 f"YouTube: {youtube}",
-                f"Обработка: {'⏸ на паузе, /resume — продолжить' if paused else '▶️ работает'}",
+                f"Обработка: {'⏸ на паузе, /resume — продолжить' if streamer.paused else '▶️ работает'}",
                 *([waiting] if waiting else []),
                 f"Автопубликация: {publishing}",
                 f"Плейлисты: {playlists}",

@@ -8,6 +8,7 @@ from html import escape
 
 from sqlalchemy import delete, func, select, update
 
+from .config import Settings
 from .context import App
 from .db import (
     Playlist,
@@ -19,8 +20,8 @@ from .db import (
     as_utc,
     dump_spans,
     dump_warnings,
+    find_streamer,
     get_spans,
-    get_streamer,
     utcnow,
 )
 from .segments import (
@@ -77,17 +78,25 @@ class IngestError(RuntimeError):
     pass
 
 
-async def ingest_vod(app: App, info: VodInfo) -> int:
-    """Создаёт сегменты VOD, ставит их в очередь загрузки и присылает в Telegram. Возвращает число сегментов."""
-    settings = app.settings
+async def ingest_vod(app: App, info: VodInfo, login: str | None = None) -> int:
+    """Создаёт сегменты VOD, ставит их в очередь загрузки и присылает в Telegram. Возвращает число сегментов.
+
+    Стример определяется по каналу VOD; login — канал, на котором слежение нашло этот VOD.
+    """
     if info.is_live:
         raise IngestError("стрим ещё идёт, VOD не завершён")
     if info.duration <= 0:
         raise IngestError("у VOD нет длительности: он ещё обрабатывается или недоступен")
-    if info.uploader_login and info.uploader_login != settings.twitch_channel.lower():
-        raise IngestError(f"VOD с канала {info.uploader_login}, а в настройках указан {settings.twitch_channel}")
+    channel = (info.uploader_login or login or "").lower()
+    if login and channel != login.lower():
+        raise IngestError(f"VOD с канала {channel}, а ожидался {login}")
+    async with app.sessions() as session:
+        streamer = await find_streamer(session, channel) if channel else None
+    if streamer is None:
+        raise IngestError(f"VOD с канала {channel or '(неизвестного)'}, а такого стримера в боте нет")
+    settings = app.config(streamer)
 
-    chapters = split_by_titles(normalize_chapters(info.chapters, info.duration), await title_marks(app, info))
+    chapters = split_by_titles(normalize_chapters(info.chapters, info.duration), await title_marks(app, info, channel))
     planned = plan_segments(chapters, min_sec=settings.min_segment_sec, join=settings.join_repeated)
     stream_titles = [p.stream_title or info.title for p in planned]
     reasons = [
@@ -107,7 +116,7 @@ async def ingest_vod(app: App, info: VodInfo) -> int:
     async with _numbering, app.sessions() as session, session.begin():
         if await session.get(Vod, info.id):
             raise IngestError("этот VOD уже обработан")
-        streamer = await get_streamer(session, settings.twitch_channel)
+        streamer = await session.get(Streamer, streamer.id)
         if info.uploader:
             streamer.display_name = info.uploader
         numbers = number_parts(
@@ -185,11 +194,11 @@ async def queue_skipped(app: App, segment_id: int, review: bool) -> bool:
         seg = await session.get(Segment, segment_id)
         if seg is None or seg.status != Status.SKIPPED:
             return False
+        vod = await session.get(Vod, seg.vod_id)
+        streamer = await session.get(Streamer, vod.streamer_id)
         key = category_key(seg.category)
-        numbered = key not in {category_key(category) for category in app.settings.unnumbered_categories}
+        numbered = key not in {category_key(category) for category in app.config(streamer).unnumbered_categories}
         if seg.kind is None and numbered:  # у Shorts номера части нет
-            vod = await session.get(Vod, seg.vod_id)
-            streamer = await session.get(Streamer, vod.streamer_id)
             seg.part = (await upload_counts(session, streamer.id)).get(key, 0) + 1
             seg.title = build_title(seg.category, seg.stream_title or vod.title, streamer.public_name, seg.part)
         seg.status = Status.QUEUED
@@ -198,10 +207,10 @@ async def queue_skipped(app: App, segment_id: int, review: bool) -> bool:
     return True
 
 
-async def title_marks(app: App, info: VodInfo) -> list[tuple[float, str]]:
+async def title_marks(app: App, info: VodInfo, channel: str) -> list[tuple[float, str]]:
     """Смены названия этого стрима, замеченные во время эфира: (секунда от начала VOD, название).
 
-    Стрим узнаётся по времени начала: VOD и стрим начинаются одновременно.
+    Стрим узнаётся по каналу и времени начала: VOD и стрим начинаются одновременно.
     """
     if info.started_at is None:
         return []
@@ -212,7 +221,7 @@ async def title_marks(app: App, info: VodInfo) -> list[tuple[float, str]]:
                 await session.scalars(
                     select(TitleChange)
                     .where(
-                        TitleChange.channel == app.settings.twitch_channel.lower(),
+                        TitleChange.channel == channel.lower(),
                         TitleChange.stream_started_at >= info.started_at - window,
                         TitleChange.stream_started_at <= info.started_at + window,
                     )
@@ -312,12 +321,11 @@ def build_metadata(app: App, seg: Segment, vod: Vod, streamer: Streamer) -> dict
         ),
         "tags": build_tags(seg.category, streamer.title_name, name, streamer.login, "стрим", "twitch"),
     }
-    return video_metadata(app, snippet)
+    return video_metadata(app.config(streamer), snippet)
 
 
-def video_metadata(app: App, snippet: dict) -> dict:
-    """Метаданные для videos.insert: язык, категория YouTube и приватный доступ."""
-    settings = app.settings
+def video_metadata(settings: Settings, snippet: dict) -> dict:
+    """Метаданные для videos.insert: язык и категория YouTube из настроек стримера, приватный доступ."""
     snippet = {**snippet, "categoryId": settings.youtube_category_id}
     if settings.youtube_language:
         snippet["defaultLanguage"] = settings.youtube_language
@@ -348,7 +356,8 @@ async def publish(app: App, segment_id: int) -> str:
         if not streamer.youtube_token:
             return "YouTube-канал не подключён: выполните /youtube"
         token = app.vault.decrypt(streamer.youtube_token)
-        privacy = app.settings.publish_privacy
+        settings = app.config(streamer)
+        privacy = settings.publish_privacy
         item = (await app.youtube.videos(token, [seg.youtube_id])).get(seg.youtube_id)
         if item is None:
             await update_segment(app, seg.id, status=Status.REJECTED, reason="ролик удалён с YouTube", check_at=None)
@@ -370,7 +379,7 @@ async def publish(app: App, segment_id: int) -> str:
             seg.id,
             status=Status.PUBLISHED,
             published_at=now,
-            monitor_until=now + timedelta(days=app.settings.monitor_days),
+            monitor_until=now + timedelta(days=settings.monitor_days),
             check_at=now + MONITOR_EVERY,
         )
         app.sync_wake.set()  # в плейлист категории
