@@ -13,9 +13,9 @@ from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy import func, select
 
-from . import consent
+from . import consent, limits
 from .context import App
-from .db import SHORT, Playlist, Segment, Status, Streamer, Vod, find_streamer, get_streamer, utcnow
+from .db import SHORT, Playlist, Segment, Status, Streamer, Vod, as_utc, find_streamer, get_streamer, utcnow
 from .segments import is_short_reason, parse_vod_id
 from .service import (
     DISCONNECTED_REASON,
@@ -42,6 +42,7 @@ from .ui import (
     YouTubeAction,
     accepted_from_action,
     confirm_keyboard,
+    local_time,
     render_consent,
     render_disconnect,
 )
@@ -273,6 +274,13 @@ async def show_status(message: Message, app: App) -> None:
     shorts_done = ", ".join(f"{label} {short_counts[key]}" for key, label in STATUS_LABELS if short_counts.get(key))
     disk = shutil.disk_usage(app.settings.data_dir)
     paused = bool(streamer and streamer.paused)
+    wait_until = streamer.uploads_wait_until if streamer else None
+    waiting = (
+        f"Загрузка: ⏳ YouTube не принимает новые ролики — {limits.describe(streamer.uploads_wait_reason)}. "
+        f"Следующая попытка в {local_time(wait_until, app.tz, '%H:%M')}, публикация идёт как обычно"
+        if wait_until and as_utc(wait_until) > utcnow()
+        else None
+    )
     settings = app.settings
     publishing = (
         f"{PUBLISH_PLACES[settings.publish_privacy]} через {settings.publish_delay_min} мин после обработки"
@@ -308,6 +316,7 @@ async def show_status(message: Message, app: App) -> None:
                 *([f"Название стрима сейчас: «{escape(app.live_title)}»"] if app.live_title else []),
                 f"YouTube: {youtube}",
                 f"Обработка: {'⏸ на паузе, /resume — продолжить' if paused else '▶️ работает'}",
+                *([waiting] if waiting else []),
                 f"Автопубликация: {publishing}",
                 f"Плейлисты: {playlists}",
                 f"Сегменты: {segments or 'пока нет'}",

@@ -55,6 +55,10 @@ class Streamer(Base):
     youtube_channel_title: Mapped[str | None] = mapped_column(String(256))
     youtube_token: Mapped[str | None] = mapped_column(Text)  # refresh-токен, зашифрован
     youtube_checked_at: Mapped[datetime | None]  # последняя ежедневная сверка с YouTube
+    # YouTube не принимает загрузки из-за лимита (причина — код ошибки YouTube): до этого времени
+    # загрузки стримера ждут, потом бот пробует снова. Публикация готовых роликов при этом идёт
+    uploads_wait_until: Mapped[datetime | None]
+    uploads_wait_reason: Mapped[str | None] = mapped_column(String(64))
     consent_version: Mapped[int | None]  # версия политики, которую принял владелец канала (consent.py)
     consent_prompted: Mapped[int | None]  # версия, принять которую бот уже предлагал
 

@@ -347,6 +347,8 @@ class FakeGoogle:
         self.channel_title = "Тестовый канал"
         self.playlists: dict[str, dict] = {}
         self.playlist_seq = 0
+        self.upload_limit = False  # канал исчерпал дневной лимит загрузок
+        self.limit_refusals = 0
 
     def app(self):
         app = web.Application(client_max_size=64 * 1024**2)
@@ -412,6 +414,11 @@ class FakeGoogle:
     async def create(self, request):
         if (denied := self._auth(request)) is not None:
             return denied
+        if self.upload_limit:
+            self.limit_refusals += 1
+            return web.json_response({"error": {"code": 400, "message": "The user has exceeded the number of videos "
+                                                "they may upload.", "errors": [{"reason": "uploadLimitExceeded"}]}},
+                                     status=400)
         total = int(request.headers["X-Upload-Content-Length"])
         meta = await request.json()
         st = meta.get("status", {})
@@ -667,6 +674,10 @@ async def main():
     async def status_in(sid, statuses):
         row = await seg(sid)
         return row if row and row.status in statuses else None
+
+    async def streamer_row():
+        async with db() as s:
+            return (await s.scalars(select(Streamer))).one()
 
     async def start_app():
         before = sum("Бот запущен" in m["text"] for _, m in tg.owner_messages())
@@ -992,6 +1003,8 @@ async def main():
                   "2885498731", 14305),
         clip_node("low", "LowViewsClip", "мало просмотров", 50, 10, "Portal 2", "2885498731", 100),
     ]
+    google.upload_limit = True  # канал исчерпал дневной лимит загрузок: Shorts сначала упрутся в него
+    since = tg.next_message_id
     APPS[-1].shorts_wake.set()
     rows = await wait_for(lambda: shorts_sent(3), 60, "Shorts из клипов")
     # Первый Shorts очередь может взять в загрузку раньше, чем тест прочитает статус
@@ -1008,6 +1021,26 @@ async def main():
     m = tg.messages[short_a.tg_message_id]
     check("🎬 <b>Shorts</b>" in m["text"] and "просмотров на Twitch: 2037" in m["text"] and m["silent"]
           and buttons(m["markup"])[0] == "▶️ Twitch", "в Telegram карточка Shorts без звука", m["text"])
+
+    notice = await wait_for(lambda: tg.find("дневной лимит канала", since), 120, "лимит канала")
+    await asyncio.sleep(3)  # бот не должен повторять попытки, пока ждёт
+    streamer = await streamer_row()
+    queued = [(await seg(short_a.id)).status, (await seg(short_f.id)).status]
+    check(tg.messages[notice]["silent"] and google.limit_refusals == 1 and not streamer.paused
+          and streamer.uploads_wait_until is not None and queued == [Status.QUEUED, Status.QUEUED],
+          "лимит канала: Shorts ждут в очереди, бот не на паузе, пишет без звука и не повторяет попытку сразу",
+          (google.limit_refusals, streamer.paused, streamer.uploads_wait_until, queued))
+    reply = await say("/status")
+    check("⏳ YouTube не принимает новые ролики — исчерпан дневной лимит канала" in reply[-1][1]["text"],
+          "в /status видно, что загрузки ждут лимита", reply[-1][1]["text"])
+    google.upload_limit = False
+    async with db() as s, s.begin():  # время ожидания вышло
+        await s.execute(update(Streamer).values(uploads_wait_until=datetime.now(timezone.utc)))
+    APPS[-1].wake.set()
+    resumed = await wait_for(lambda: tg.find("снова принимает загрузки", since), 120, "загрузки после лимита")
+    check(tg.messages[resumed]["silent"] and (await streamer_row()).uploads_wait_until is None,
+          "когда время ожидания вышло, загрузка продолжилась сама, без /resume")
+
     waiting = await wait_for(lambda: status_in(short_a.id, (Status.WAITING,)), 300, "Shorts A обработан")
     left = (as_utc(waiting.publish_after) - datetime.now(timezone.utc)).total_seconds()
     check(0 < left <= 60, f"Shorts ждёт публикации свою минуту (SHORTS_PUBLISH_DELAY_MIN), осталось {left:.0f} с", left)
@@ -1039,10 +1072,6 @@ async def main():
     async def run_daily_check():
         async with db() as s, s.begin():
             await s.execute(update(Streamer).values(youtube_checked_at=None))
-
-    async def streamer_row():
-        async with db() as s:
-            return (await s.scalars(select(Streamer))).one()
 
     uploaded = [s_mc.id, n_jc.id, n_mc.id, s_jc.id, w_mc.id, w_jc.id]
     google.videos.pop((await seg(s_mc.id)).youtube_id)  # отклонённый ролик удалили в YouTube Studio
