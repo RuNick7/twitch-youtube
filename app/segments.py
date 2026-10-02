@@ -14,6 +14,7 @@ from typing import Iterable, List, Optional, Tuple
 # YouTube принимает ролики до 12 часов; делим всё, что длиннее 11 ч 50 мин
 SPLIT_LIMIT_SEC = 12 * 3600 - 10 * 60
 TITLE_MAX_CHARS = 100
+PLAYLIST_TITLE_MAX_CHARS = 150
 DESCRIPTION_MAX_BYTES = 5000
 TAGS_MAX_CHARS = 500
 FALLBACK_CATEGORY = "Стрим"
@@ -32,7 +33,6 @@ class PlannedSegment:
     start: int  # начало первого отрезка
     end: int  # конец последнего отрезка
     category: str
-    part: Optional[int] = None  # номер, если такой же сегмент встречается несколько раз
     stream_title: Optional[str] = None
     ranges: List[Tuple[int, int]] = field(default_factory=list)  # пусто — один отрезок [start, end)
 
@@ -110,7 +110,6 @@ def plan_segments(
     chapters: List[Chapter],
     min_sec: int = 120,
     split_limit: int = SPLIT_LIMIT_SEC,
-    no_part: Iterable[str] = (),
     join: bool = False,
 ) -> List[PlannedSegment]:
     """Каждая смена категории или названия стрима — отдельный сегмент.
@@ -119,9 +118,7 @@ def plan_segments(
     опечатка в названии) приклеиваются к предыдущему сегменту, а в начале
     стрима — к следующему. С join повторы с той же категорией и тем же
     названием склеиваются в один ролик из нескольких отрезков. Сегменты
-    длиннее split_limit делятся на равные части. Если одинаковые категория и
-    название всё же встречаются несколько раз, сегменты нумеруются: «часть 1»,
-    «часть 2» — кроме категорий из no_part.
+    длиннее split_limit делятся на равные части. Номера частей — number_parts.
     """
     segments = _merge_same(
         [
@@ -160,16 +157,49 @@ def plan_segments(
                     ranges=spans if len(spans) > 1 else [],
                 )
             )
+    return result
 
-    unnumbered = {_fold(category) for category in no_part}
-    totals: dict = {}
-    for seg in result:
-        totals[seg.key] = totals.get(seg.key, 0) + 1
+
+def category_key(category: Optional[str]) -> str:
+    """Категория без учёта регистра и «ё»: по ней считаются части и выбирается плейлист."""
+    return _fold(clean_line(category) or FALLBACK_CATEGORY)
+
+
+def number_parts(
+    segments: List[PlannedSegment],
+    uploaded: Optional[List[bool]] = None,
+    no_part: Iterable[str] = (),
+    counts: Optional[dict] = None,
+) -> List[Optional[int]]:
+    """Номер части каждого сегмента: «Часть 7».
+
+    Нумерация сквозная по категории, от стрима к стриму: counts — сколько роликов
+    каждой категории (ключ — category_key) загружалось раньше. Пропущенные сегменты
+    номера не получают и счёт не двигают. Категории из no_part не нумеруются, кроме
+    отрезка длиннее 12 часов: его куски с одинаковым названием получают «Часть 1», «Часть 2».
+    """
+    flags = uploaded if uploaded is not None else [True] * len(segments)
+    unnumbered = {category_key(category) for category in no_part}
+    same: dict = {}
+    for seg, flag in zip(segments, flags):
+        if flag and category_key(seg.category) in unnumbered:
+            same[seg.key] = same.get(seg.key, 0) + 1
+    last = dict(counts or {})
     seen: dict = {}
-    for seg in result:
-        if totals[seg.key] > 1 and _fold(seg.category) not in unnumbered:
-            seen[seg.key] = seen.get(seg.key, 0) + 1
-            seg.part = seen[seg.key]
+    result: List[Optional[int]] = []
+    for seg, flag in zip(segments, flags):
+        key = category_key(seg.category)
+        if not flag:
+            result.append(None)
+        elif key in unnumbered:
+            if same[seg.key] > 1:
+                seen[seg.key] = seen.get(seg.key, 0) + 1
+                result.append(seen[seg.key])
+            else:
+                result.append(None)
+        else:
+            last[key] = last.get(key, 0) + 1
+            result.append(last[key])
     return result
 
 
@@ -286,24 +316,49 @@ def clean_line(text: Optional[str]) -> str:
     return _SPACES.sub(" ", _ANGLE_BRACKETS.sub("", text or "")).strip()
 
 
+TITLE_SEPARATOR = " | "
+
+
 def build_title(
     category: str, stream_title: str, streamer: str, part: Optional[int] = None, limit: int = TITLE_MAX_CHARS
 ) -> str:
-    """«{игра} — {название стрима} | {стример}», не длиннее limit символов."""
+    """«{категория} | {название стрима} | Часть {N} | {стример}», не длиннее limit символов.
+
+    Категория, часть и стример обязательны: если всё не помещается, сокращается название стрима.
+    """
     head = clean_line(category) or FALLBACK_CATEGORY
-    if part:
-        head += f" (часть {part})"
+    tail = [item for item in (f"Часть {part}" if part else "", clean_line(streamer)) if item]
     body = clean_line(stream_title)
-    name = clean_line(streamer)
-    tail = f" | {name}" if name else ""
-    title = f"{head} — {body}{tail}" if body else f"{head}{tail}"
+    title = TITLE_SEPARATOR.join([head, body, *tail] if body else [head, *tail])
     if len(title) <= limit:
         return title
-    room = limit - len(f"{head} — …{tail}")
+    fixed = TITLE_SEPARATOR.join([head, *tail])
+    room = limit - len(fixed) - len(TITLE_SEPARATOR)
     if body and room >= 10:
-        return f"{head} — {body[:room].rstrip()}…{tail}"
-    title = f"{head} — {body}" if body else head
-    return title if len(title) <= limit else title[: limit - 1].rstrip() + "…"
+        return TITLE_SEPARATOR.join([head, _shorten(body, room), *tail])
+    if len(fixed) <= limit:
+        return fixed
+    # Не помещается даже без названия стрима — значит, слишком длинная категория
+    rest = "".join(TITLE_SEPARATOR + item for item in tail)
+    return _shorten(head, limit - len(rest)) + rest
+
+
+def build_playlist_title(category: str, streamer: str, limit: int = PLAYLIST_TITLE_MAX_CHARS) -> str:
+    """«{категория} | {стример}» — плейлист со всеми роликами категории."""
+    name = clean_line(streamer)
+    tail = f"{TITLE_SEPARATOR}{name}" if name else ""
+    return _shorten(clean_line(category) or FALLBACK_CATEGORY, limit - len(tail)) + tail
+
+
+def _shorten(text: str, room: int) -> str:
+    """Обрезает текст до room символов вместе с «…», по возможности на границе слова."""
+    if len(text) <= room:
+        return text
+    cut = text[: max(room - 1, 0)]
+    space = cut.rfind(" ")
+    if space >= room // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,.;:!?-—|") + "…"
 
 
 def build_description(

@@ -350,6 +350,52 @@ class YouTubeClient:
             raise _error(resp)
         return resp.json().get("status") or {}
 
+    # --- плейлисты ---
+
+    async def create_playlist(self, refresh_token: str, title: str, description: str, privacy: str) -> str:
+        """Создаёт плейлист на канале и возвращает его ID. 50 единиц квоты."""
+        resp = await self._api(
+            "POST",
+            "playlists",
+            refresh_token,
+            params={"part": "snippet,status"},
+            json={"snippet": {"title": title, "description": description}, "status": {"privacyStatus": privacy}},
+        )
+        if resp.status_code != 200:
+            raise _error(resp)
+        return resp.json()["id"]
+
+    async def add_to_playlist(self, refresh_token: str, playlist_id: str, video_id: str) -> str:
+        """Добавляет ролик в конец плейлиста и возвращает ID элемента. 50 единиц квоты.
+
+        Удалённый плейлист — YouTubeError с reason playlistNotFound.
+        """
+        resp = await self._api(
+            "POST",
+            "playlistItems",
+            refresh_token,
+            params={"part": "snippet"},
+            json={"snippet": {"playlistId": playlist_id, "resourceId": {"kind": "youtube#video", "videoId": video_id}}},
+        )
+        if resp.status_code != 200:
+            raise _error(resp)
+        return resp.json()["id"]
+
+    async def my_playlists(self, refresh_token: str) -> set[str]:
+        """ID всех плейлистов канала. 1 единица квоты на 50 плейлистов."""
+        result: set[str] = set()
+        page: str | None = None
+        while True:
+            params = {"part": "id", "mine": "true", "maxResults": "50", **({"pageToken": page} if page else {})}
+            resp = await self._api("GET", "playlists", refresh_token, params=params)
+            if resp.status_code != 200:
+                raise _error(resp)
+            data = resp.json()
+            result.update(item["id"] for item in data.get("items") or [])
+            page = data.get("nextPageToken")
+            if not page:
+                return result
+
     async def _create_session(self, refresh_token: str, total: int, metadata: dict) -> str:
         resp = await self._http.post(
             UPLOAD_URL,

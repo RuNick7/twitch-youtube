@@ -9,16 +9,29 @@ from zoneinfo import ZoneInfo
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from .clips import clip_url
 from .config import Settings
-from .db import Segment, Status, Streamer, Vod, as_utc, get_spans, get_warnings
+from .db import SHORT, Segment, Status, Streamer, Vod, as_utc, get_spans, get_warnings
 from .segments import fmt_duration, fmt_spans, twitch_time_param
 
 PUBLISH, KEEP, RETRY, FORCE = "pub", "keep", "rt", "force"
-CONNECT, DISCONNECT, CANCEL = "on", "off", "cancel"
+CONNECT, ACCEPT, DISCONNECT, CANCEL = "on", "accept", "off", "cancel"
 
 YOUTUBE_TERMS_URL = "https://www.youtube.com/t/terms"
 GOOGLE_PRIVACY_URL = "https://www.google.com/policies/privacy"
 PRIVACY_NAMES = {"private": "приватным", "unlisted": "доступным только по ссылке", "public": "публичным"}
+PLAYLIST_PRIVACY = {"unlisted": "доступные по ссылке", "public": "публичные"}
+
+
+def accept_action(version: int) -> str:
+    """Кнопка «Принимаю» запоминает, какую версию политики показали: accept3."""
+    return f"{ACCEPT}{version}"
+
+
+def accepted_from_action(action: str) -> int:
+    """Версия из кнопки; у кнопок до версий политики было просто accept — это версия 2."""
+    suffix = action[len(ACCEPT):]
+    return int(suffix) if suffix.isdigit() else 2
 
 
 class SegmentAction(CallbackData, prefix="seg"):
@@ -46,9 +59,12 @@ def confirm_keyboard(text: str, action: str) -> InlineKeyboardMarkup:
     )
 
 
-def render_consent(settings: Settings, streamer_name: str) -> str:
-    """Что AutoVOD будет делать с каналом. Правила YouTube API требуют показать это
-    и получить согласие с политикой конфиденциальности до входа."""
+def render_consent(settings: Settings, streamer_name: str, changes: list[str] | None = None) -> str:
+    """Что AutoVOD будет делать с каналом. Правила YouTube API требуют показать это и получить
+    согласие с политикой конфиденциальности до входа, а когда политика меняется — снова.
+
+    changes — что нового в политике, если владелец принимает обновлённую версию.
+    """
     privacy = PRIVACY_NAMES[settings.publish_privacy]
     if settings.auto_publish:
         publishing = (
@@ -57,15 +73,42 @@ def render_consent(settings: Settings, streamer_name: str) -> str:
         )
     else:
         publishing = f"делать ролик {privacy} только по вашей кнопке «Опубликовать»"
+    if changes:
+        header = (
+            "📄 <b>Политика конфиденциальности AutoVOD обновлена</b>\n"
+            f"Теперь бот {' и '.join(changes)}. Пока вы не примете новую политику, это не включится, "
+            "остальное работает как раньше.\n\n"
+        )
+    else:
+        header = "<b>Подключение YouTube-канала</b>\n\n"
+    playlists = (
+        f"• создавать {PLAYLIST_PRIVACY[settings.publish_privacy]} плейлисты по категориям и добавлять в них "
+        "опубликованные ролики;\n"
+        if settings.playlists
+        else ""
+    )
+    shorts_publishing = (
+        f"публиковать их через {settings.shorts_publish_delay_min} мин после обработки по тем же правилам"
+        if settings.auto_publish
+        else "публиковать их только по вашей кнопке"
+    )
+    shorts = (
+        f"• делать из клипов канала от {settings.shorts_min_views} просмотров вертикальные ролики Shorts "
+        f"и {shorts_publishing};\n"
+        if settings.shorts
+        else ""
+    )
     return (
-        "<b>Подключение YouTube-канала</b>\n\n"
+        f"{header}"
         "С доступом к каналу AutoVOD будет:\n"
         f"• загружать на него сегменты стримов {escape(streamer_name)} приватными роликами;\n"
         f"• {publishing};\n"
-        "• проверять состояние загруженных им роликов.\n\n"
-        "Другие ролики, комментарии, плейлисты и статистику канала AutoVOD не трогает. Он хранит зашифрованный "
-        "токен доступа, ID и название канала, ID и состояние своих роликов и раз в сутки сверяет их с YouTube. "
-        "Отключить канал и удалить эти данные — /disconnect.\n\n"
+        f"{playlists}"
+        f"{shorts}"
+        "• проверять состояние загруженных им роликов и созданных плейлистов.\n\n"
+        "Другие ролики и плейлисты, комментарии и статистику канала AutoVOD не трогает. Он хранит "
+        "зашифрованный токен доступа, ID и название канала, ID и состояние своих роликов, ID своих плейлистов "
+        "и раз в сутки сверяет их с YouTube. Отключить канал и удалить эти данные — /disconnect.\n\n"
         f'Нажимая «Принимаю», вы соглашаетесь с <a href="{escape(settings.privacy_url)}">политикой '
         f'конфиденциальности</a> и <a href="{escape(settings.terms_url)}">условиями использования</a> AutoVOD '
         f'и с <a href="{YOUTUBE_TERMS_URL}">Условиями использования YouTube</a>. Как Google обращается с данными: '
@@ -99,7 +142,8 @@ def local_time(value: datetime | None, tz: ZoneInfo, fmt: str = "%d.%m") -> str:
 
 
 def segment_keyboard(seg: Segment) -> InlineKeyboardMarkup | None:
-    links = [InlineKeyboardButton(text="▶️ Twitch", url=twitch_link(seg.vod_id, seg.start))]
+    source = clip_url(seg.clip_slug or "") if seg.kind == SHORT else twitch_link(seg.vod_id, seg.start)
+    links = [InlineKeyboardButton(text="▶️ Twitch", url=source)]
     if seg.youtube_id:
         links.append(InlineKeyboardButton(text="🛠 YouTube Studio", url=studio_link(seg.youtube_id)))
     if seg.status == Status.SKIPPED:
@@ -149,9 +193,25 @@ def status_line(seg: Segment, tz: ZoneInfo, privacy: str) -> str:
     return seg.status
 
 
+def render_short(seg: Segment, tz: ZoneInfo, privacy: str) -> str:
+    author = f", автор {escape(seg.clip_author)}" if seg.clip_author else ""
+    lines = [
+        f"🎬 <b>Shorts</b> · {escape(seg.category)} · {seg.end - seg.start} с",
+        f"Клип «{escape(seg.clip_title or '')}» от {local_time(seg.clip_created_at, tz)}{author}, "
+        f"просмотров на Twitch: {seg.clip_views or 0}",
+        f"Название: {escape(seg.title)}",
+        "",
+        status_line(seg, tz, privacy),
+    ]
+    lines += [f"• {escape(warning)}" for warning in get_warnings(seg)]
+    return "\n".join(lines)
+
+
 def render_segment(
     seg: Segment, vod: Vod, streamer: Streamer, tz: ZoneInfo, privacy: str
 ) -> tuple[str, InlineKeyboardMarkup | None]:
+    if seg.kind == SHORT:
+        return render_short(seg, tz, privacy), segment_keyboard(seg)
     part = f" (часть {seg.part})" if seg.part else ""
     date = local_time(vod.started_at, tz)
     name = escape(seg.stream_title or vod.title)

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from html import escape
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 
+from . import consent
 from .context import App
 from .db import (
+    Playlist,
     Segment,
     Status,
     Streamer,
@@ -25,8 +28,10 @@ from .segments import (
     build_description,
     build_tags,
     build_title,
+    category_key,
     category_warnings,
     normalize_chapters,
+    number_parts,
     plan_segments,
     short_reason,
     skip_reason,
@@ -59,12 +64,14 @@ YOUTUBE_FIELDS = dict(
     publish_after=None,
     published_at=None,
     monitor_until=None,
+    playlist_added_at=None,
 )
 DISCONNECTED_REASON = "YouTube-канал отключён: данные о ролике удалены"
 REVOKED_REASON = "доступ к YouTube отозван: данные о ролике удалены"
 DELETED_REASON = "ролика больше нет на YouTube: данные о нём удалены"
 
 _publishing: set[int] = set()
+_numbering = asyncio.Lock()
 
 
 class IngestError(RuntimeError):
@@ -82,21 +89,35 @@ async def ingest_vod(app: App, info: VodInfo) -> int:
         raise IngestError(f"VOD с канала {info.uploader_login}, а в настройках указан {settings.twitch_channel}")
 
     chapters = split_by_titles(normalize_chapters(info.chapters, info.duration), await title_marks(app, info))
-    planned = plan_segments(
-        chapters,
-        min_sec=settings.min_segment_sec,
-        no_part=settings.unnumbered_categories,
-        join=settings.join_repeated,
-    )
+    planned = plan_segments(chapters, min_sec=settings.min_segment_sec, join=settings.join_repeated)
+    stream_titles = [p.stream_title or info.title for p in planned]
+    reasons = [
+        skip_reason(
+            p.category,
+            stream_title,
+            keywords=settings.keywords,
+            title_categories=settings.title_categories,
+            categories=settings.skipped_categories,
+        )
+        or short_reason(p.duration, settings.skip_shorter_min)
+        for p, stream_title in zip(planned, stream_titles)
+    ]
     now = utcnow()
 
-    async with app.sessions() as session, session.begin():
+    # Номера частей сквозные: два VOD, обработанные одновременно, не должны получить одинаковые
+    async with _numbering, app.sessions() as session, session.begin():
         if await session.get(Vod, info.id):
             raise IngestError("этот VOD уже обработан")
         streamer = await get_streamer(session, settings.twitch_channel)
         if info.uploader:
             streamer.display_name = info.uploader
         name = streamer.display_name or streamer.login
+        numbers = number_parts(
+            planned,
+            [reason is None for reason in reasons],
+            settings.unnumbered_categories,
+            await upload_counts(session, streamer.id),
+        )
         vod = Vod(
             id=info.id,
             streamer_id=streamer.id,
@@ -109,16 +130,10 @@ async def ingest_vod(app: App, info: VodInfo) -> int:
         # сегменты раньше VOD — тогда SQLite отвергнет их по внешнему ключу
         session.add(vod)
         await session.flush()
+        # В конце названия — имя, по которому стримера ищут зрители, а не название его канала
+        title_name = settings.streamer_name or name
         segments = []
-        for i, p in enumerate(planned, 1):
-            stream_title = p.stream_title or info.title
-            reason = skip_reason(
-                p.category,
-                stream_title,
-                keywords=settings.keywords,
-                title_categories=settings.title_categories,
-                categories=settings.skipped_categories,
-            ) or short_reason(p.duration, settings.skip_shorter_min)
+        for i, (p, stream_title, reason, part) in enumerate(zip(planned, stream_titles, reasons, numbers), 1):
             segments.append(
                 Segment(
                     vod_id=info.id,
@@ -126,8 +141,8 @@ async def ingest_vod(app: App, info: VodInfo) -> int:
                     start=p.start,
                     end=p.end,
                     category=p.category,
-                    part=p.part,
-                    title=build_title(p.category, stream_title, name, p.part),
+                    part=part,
+                    title=build_title(p.category, stream_title, title_name, part),
                     stream_title=stream_title,
                     ranges=dump_spans(p.spans),
                     status=Status.SKIPPED if reason else Status.QUEUED,
@@ -146,6 +161,44 @@ async def ingest_vod(app: App, info: VodInfo) -> int:
             await update_segment(app, seg.id, tg_message_id=message.message_id)
     app.wake.set()
     return len(segments)
+
+
+async def upload_counts(session, streamer_id: int) -> dict[str, int]:
+    """Сколько роликов каждой категории (ключ — category_key) бот уже загружал или поставил в очередь."""
+    rows = await session.execute(
+        select(Segment.category, func.count())
+        .join(Vod, Vod.id == Segment.vod_id)
+        .where(Vod.streamer_id == streamer_id, Segment.status != Status.SKIPPED, Segment.kind.is_(None))
+        .group_by(Segment.category)
+    )
+    counts: dict[str, int] = {}
+    for category, count in rows.all():
+        counts[category_key(category)] = counts.get(category_key(category), 0) + count
+    return counts
+
+
+async def queue_skipped(app: App, segment_id: int, review: bool) -> bool:
+    """Ставит пропущенный сегмент в очередь (кнопка «Всё равно загрузить»). False — он уже не пропущен.
+
+    Сегмент получает следующий номер части своей категории: номер и очередь меняются
+    вместе, чтобы одновременная нарезка нового VOD не взяла тот же номер.
+    """
+    async with _numbering, app.sessions() as session, session.begin():
+        seg = await session.get(Segment, segment_id)
+        if seg is None or seg.status != Status.SKIPPED:
+            return False
+        key = category_key(seg.category)
+        numbered = key not in {category_key(category) for category in app.settings.unnumbered_categories}
+        if seg.kind is None and numbered:  # у Shorts номера части нет
+            vod = await session.get(Vod, seg.vod_id)
+            streamer = await session.get(Streamer, vod.streamer_id)
+            seg.part = (await upload_counts(session, streamer.id)).get(key, 0) + 1
+            name = app.settings.streamer_name or streamer.display_name or streamer.login
+            seg.title = build_title(seg.category, seg.stream_title or vod.title, name, seg.part)
+        seg.status = Status.QUEUED
+        seg.queued_at = utcnow()
+        seg.force_review = review
+    return True
 
 
 async def title_marks(app: App, info: VodInfo) -> list[tuple[float, str]]:
@@ -200,9 +253,10 @@ async def set_status(app: App, segment_id: int, allowed_from: tuple[str, ...], t
 
 
 async def forget_youtube(app: App, streamer_id: int, reason: str) -> None:
-    """Удаляет всё, что AutoVOD получил от YouTube для канала: токен, ID и название канала, ID и состояние роликов.
+    """Удаляет всё, что AutoVOD получил от YouTube для канала: токен, ID и название канала, ID и состояние
+    роликов, ID плейлистов, а заодно и согласие с политикой.
 
-    Правила YouTube API требуют этого после отзыва доступа. Сами ролики остаются на YouTube,
+    Правила YouTube API требуют этого после отзыва доступа. Сами ролики и плейлисты остаются на YouTube,
     а сегменты, которые ещё не загружены, ждут в очереди нового подключения.
     """
     vods = select(Vod.id).where(Vod.streamer_id == streamer_id)
@@ -211,6 +265,7 @@ async def forget_youtube(app: App, streamer_id: int, reason: str) -> None:
         if streamer.youtube_token:
             app.youtube.forget(app.vault.decrypt(streamer.youtube_token))
         streamer.youtube_token = streamer.youtube_channel_id = streamer.youtube_channel_title = None
+        await session.execute(delete(Playlist).where(Playlist.streamer_id == streamer_id))
         # У этих сегментов в Telegram кнопки, которые больше ничего не сделают
         with_buttons = list(
             (
@@ -232,13 +287,16 @@ async def forget_youtube(app: App, streamer_id: int, reason: str) -> None:
         await session.execute(
             update(Segment).where(Segment.vod_id.in_(vods), Segment.upload_uri.is_not(None)).values(upload_uri=None)
         )
+    await consent.forget(app)
     for segment_id in with_buttons:
         await app.refresh_segment(segment_id)
 
 
-async def status_counts(app: App) -> dict[str, int]:
+async def status_counts(app: App, kind: str | None = None) -> dict[str, int]:
+    """Число сегментов (kind=None) или Shorts (kind=SHORT) по статусам."""
+    condition = Segment.kind.is_(None) if kind is None else Segment.kind == kind
     async with app.sessions() as session:
-        rows = await session.execute(select(Segment.status, func.count()).group_by(Segment.status))
+        rows = await session.execute(select(Segment.status, func.count()).where(condition).group_by(Segment.status))
     return {status: count for status, count in rows.all()}
 
 
@@ -255,9 +313,15 @@ def build_metadata(app: App, seg: Segment, vod: Vod, streamer: Streamer) -> dict
             seg.category,
             get_spans(seg),
         ),
-        "tags": build_tags(seg.category, name, streamer.login, "стрим", "twitch"),
-        "categoryId": settings.youtube_category_id,
+        "tags": build_tags(seg.category, settings.streamer_name, name, streamer.login, "стрим", "twitch"),
     }
+    return video_metadata(app, snippet)
+
+
+def video_metadata(app: App, snippet: dict) -> dict:
+    """Метаданные для videos.insert: язык, категория YouTube и приватный доступ."""
+    settings = app.settings
+    snippet = {**snippet, "categoryId": settings.youtube_category_id}
     if settings.youtube_language:
         snippet["defaultLanguage"] = settings.youtube_language
         snippet["defaultAudioLanguage"] = settings.youtube_language
@@ -312,6 +376,7 @@ async def publish(app: App, segment_id: int) -> str:
             monitor_until=now + timedelta(days=app.settings.monitor_days),
             check_at=now + MONITOR_EVERY,
         )
+        app.sync_wake.set()  # в плейлист категории
         await app.refresh_segment(seg.id)
         await app.notify(
             f"✅ Опубликовано: «{escape(seg.title)}» {youtube_link(seg.youtube_id)}",

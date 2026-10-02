@@ -19,6 +19,9 @@ class Settings(BaseSettings):
 
     # Логин стримера: twitch.tv/<логин>
     twitch_channel: str
+    # Имя стримера в конце названия ролика — так, как его ищут зрители (например, «Заквиель»).
+    # Пусто — имя канала на Twitch
+    streamer_name: str = ""
 
     # OAuth-клиент Google типа «TVs and Limited Input devices»
     google_client_id: str = ""
@@ -40,6 +43,17 @@ class Settings(BaseSettings):
 
     youtube_language: str = "ru"
     youtube_category_id: str = "20"  # Gaming
+    # Плейлист на каждую категорию: опубликованный ролик добавляется в плейлист своей категории
+    playlists: bool = True
+
+    # Shorts из популярных клипов канала за последние 7 дней: от shorts_min_views просмотров
+    # на Twitch, не больше shorts_per_day за сутки; список клипов проверяется раз в shorts_check_min минут
+    shorts: bool = True
+    shorts_min_views: int = 100
+    shorts_per_day: int = 2
+    shorts_check_min: int = 60
+    # Shorts короткие и проверяются быстрее: публикуются через столько минут после обработки, а не через publish_delay_min
+    shorts_publish_delay_min: int = 30
 
     # Политика конфиденциальности и условия использования: бот показывает их перед подключением канала.
     # Своя копия бота публикуется со своими страницами
