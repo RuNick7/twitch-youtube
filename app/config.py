@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     shorts_min_views: int = 100
     shorts_per_day: int = 2
     shorts_check_min: int = 60
+    # Shorts короткие и проверяются быстрее: публикуются через столько минут после обработки, а не через publish_delay_min
+    shorts_publish_delay_min: int = 30
 
     # Политика конфиденциальности и условия использования: бот показывает их перед подключением канала.
     # Своя копия бота публикуется со своими страницами

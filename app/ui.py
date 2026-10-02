@@ -87,9 +87,14 @@ def render_consent(settings: Settings, streamer_name: str, changes: list[str] | 
         if settings.playlists
         else ""
     )
+    shorts_publishing = (
+        f"публиковать их через {settings.shorts_publish_delay_min} мин после обработки по тем же правилам"
+        if settings.auto_publish
+        else "публиковать их только по вашей кнопке"
+    )
     shorts = (
         f"• делать из клипов канала от {settings.shorts_min_views} просмотров вертикальные ролики Shorts "
-        "и публиковать их так же, как сегменты;\n"
+        f"и {shorts_publishing};\n"
         if settings.shorts
         else ""
     )

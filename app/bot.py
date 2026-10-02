@@ -292,7 +292,8 @@ async def show_status(message: Message, app: App) -> None:
     else:
         shorts = (
             f"из клипов за 7 дней от {settings.shorts_min_views} просмотров, не больше {settings.shorts_per_day} "
-            f"в сутки; {shorts_done or 'пока нет'}"
+            f"в сутки, публикация через {settings.shorts_publish_delay_min} мин после обработки; "
+            f"{shorts_done or 'пока нет'}"
         )
     await message.answer(
         "\n".join(

@@ -52,6 +52,8 @@ os.environ.update(
     STREAMER_NAME="Заквиель",
     # Minecraft нумеруется: в шаге 9 его короткий кусок пропущен и не должен превратить единственную часть в «2/2»
     NO_PART_CATEGORIES="Just Chatting",
+    # Shorts ждут дольше сегментов: минута против нуля, чтобы проверить, что задержки разные
+    SHORTS_PUBLISH_DELAY_MIN="1",
 )
 
 import app.__main__ as entry  # noqa: E402
@@ -78,6 +80,7 @@ from app.db import (  # noqa: E402
     Streamer,
     TitleChange,
     Vod,
+    as_utc,
     get_spans,
     get_warnings,
     make_engine,
@@ -992,6 +995,9 @@ async def main():
     m = tg.messages[short_a.tg_message_id]
     check("🎬 <b>Shorts</b>" in m["text"] and "просмотров на Twitch: 2037" in m["text"] and m["silent"]
           and buttons(m["markup"])[0] == "▶️ Twitch", "в Telegram карточка Shorts без звука", m["text"])
+    waiting = await wait_for(lambda: status_in(short_a.id, (Status.WAITING,)), 300, "Shorts A обработан")
+    left = (as_utc(waiting.publish_after) - datetime.now(timezone.utc)).total_seconds()
+    check(0 < left <= 60, f"Shorts ждёт публикации свою минуту (SHORTS_PUBLISH_DELAY_MIN), осталось {left:.0f} с", left)
     row = await wait_for(lambda: status_in(short_a.id, finals), 300, "Shorts A")
     row_f = await wait_for(lambda: status_in(short_f.id, finals), 300, "Shorts F")
     check(row.status == Status.PUBLISHED and row_f.status == Status.PUBLISHED, "Shorts опубликованы сами",

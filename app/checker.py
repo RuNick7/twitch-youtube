@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from .checks import FAILED, READY, REJECTED, failure_reason, processing_state, youtube_warnings
 from .context import App
-from .db import Segment, Status, Streamer, Vod, as_utc, dump_warnings, get_warnings, utcnow
+from .db import SHORT, Segment, Status, Streamer, Vod, as_utc, dump_warnings, get_warnings, utcnow
 from .service import MONITOR_EVERY, publish, update_segment
 from .ui import PRIVACY_NAMES
 from .worker import is_paused, set_paused
@@ -107,7 +107,9 @@ class Checker:
 
         if seg.status == Status.PROCESSING:
             if state == READY:
-                publish_after = now + timedelta(minutes=app.settings.publish_delay_min)
+                settings = app.settings
+                delay = settings.shorts_publish_delay_min if seg.kind == SHORT else settings.publish_delay_min
+                publish_after = now + timedelta(minutes=delay)
                 await update_segment(app, seg.id, status=Status.WAITING, publish_after=publish_after, check_at=publish_after)
                 await app.refresh_segment(seg.id)
             else:
