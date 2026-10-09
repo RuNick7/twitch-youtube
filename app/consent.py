@@ -2,13 +2,15 @@
 
 Правила YouTube API: если бот начинает использовать данные так, как политика
 не описывала, политику обновляют и снова просят согласия. Версия принятой
-политики хранится в базе.
+политики хранится у стримера, чей канал подключён.
 """
 
 from __future__ import annotations
 
+from sqlalchemy import update
+
 from .context import App
-from .db import find_streamer, kv_delete, kv_get, kv_set
+from .db import Streamer, all_streamers
 from .ui import accept_action, confirm_keyboard, render_consent
 
 # 1 — загрузка и публикация роликов, 2 — плейлисты по категориям, 3 — Shorts из клипов
@@ -20,49 +22,38 @@ CHANGES = {
     PLAYLISTS_SINCE: "раскладывает опубликованные ролики по плейлистам категорий",
     SHORTS_SINCE: "делает Shorts из самых просматриваемых клипов канала",
 }
-ACCEPTED_KEY = "consent_version"
-PROMPTED_KEY = "consent_prompted"
 
 
-async def accepted_version(app: App) -> int:
-    """Версия политики, которую принял владелец; 0 — канал подключали до появления версий."""
-    async with app.sessions() as session:
-        value = await kv_get(session, ACCEPTED_KEY)
-    return int(value) if value else 0
+def accepted_version(streamer: Streamer) -> int:
+    """Версия политики, которую принял владелец канала; 0 — канал подключали до появления версий."""
+    return streamer.consent_version or 0
 
 
-async def accept(app: App, version: int = CONSENT_VERSION) -> None:
-    """Владелец принял версию политики, которую ему показали."""
-    current = await accepted_version(app)
+async def accept(app: App, streamer_id: int, version: int = CONSENT_VERSION) -> None:
+    """Владелец канала принял версию политики, которую ему показали."""
     async with app.sessions() as session, session.begin():
-        await kv_set(session, ACCEPTED_KEY, str(max(current, version)))
+        streamer = await session.get(Streamer, streamer_id)
+        streamer.consent_version = max(accepted_version(streamer), version)
     app.sync_wake.set()
     app.shorts_wake.set()
 
 
-async def forget(app: App) -> None:
-    """Канал отключён: согласие нужно получить заново при следующем подключении."""
-    async with app.sessions() as session, session.begin():
-        await kv_delete(session, ACCEPTED_KEY)
-        await kv_delete(session, PROMPTED_KEY)
-
-
 async def prompt_update(app: App) -> None:
-    """Если канал подключён по старой версии политики, один раз просит принять новую."""
+    """Если канал подключён по старой версии политики, один раз просит принять новую. Согласие у каждого канала своё."""
     async with app.sessions() as session:
-        streamer = await find_streamer(session, app.settings.twitch_channel)
-        prompted = await kv_get(session, PROMPTED_KEY)
-    if not (streamer and streamer.youtube_token) or prompted == str(CONSENT_VERSION):
-        return
-    accepted = await accepted_version(app)
-    if accepted >= CONSENT_VERSION:
-        return
-    name = streamer.display_name or app.settings.twitch_channel
-    changes = [text for version, text in sorted(CHANGES.items()) if version > accepted]
-    message = await app.notify(
-        render_consent(app.settings, name, changes=changes),
-        markup=confirm_keyboard("✅ Принимаю", accept_action(CONSENT_VERSION)),
-    )
-    if message:
-        async with app.sessions() as session, session.begin():
-            await kv_set(session, PROMPTED_KEY, str(CONSENT_VERSION))
+        streamers = await all_streamers(session, connected=True)
+    for streamer in streamers:
+        accepted = accepted_version(streamer)
+        if streamer.consent_prompted == CONSENT_VERSION or accepted >= CONSENT_VERSION:
+            continue
+        name = streamer.display_name or streamer.login
+        changes = [text for version, text in sorted(CHANGES.items()) if version > accepted]
+        message = await app.notify(
+            render_consent(app.config(streamer), name, changes=changes),
+            markup=confirm_keyboard("✅ Принимаю", accept_action(CONSENT_VERSION), streamer.id),
+        )
+        if message:
+            async with app.sessions() as session, session.begin():
+                await session.execute(
+                    update(Streamer).where(Streamer.id == streamer.id).values(consent_prompted=CONSENT_VERSION)
+                )

@@ -13,8 +13,10 @@ from app.segments import (
     fmt_hms,
     fmt_spans,
     is_short_reason,
+    match_streamer,
     normalize_chapters,
     number_parts,
+    parse_channel,
     parse_vod_id,
     plan_segments,
     short_reason,
@@ -430,6 +432,68 @@ class JoinRepeatedTest(unittest.TestCase):
 
     def test_fmt_spans(self):
         self.assertEqual(fmt_spans([(0, 2403), (17917, 27310)]), "0:00–40:03, 4:58:37–7:35:10")
+
+
+class Row:
+    """Стример, как его видит match_streamer."""
+
+    def __init__(self, login, display_name=None, title_name=None):
+        self.login, self.display_name, self.title_name = login, display_name, title_name
+
+
+class ParseChannelTest(unittest.TestCase):
+    def test_login_and_links(self):
+        for text in (
+            "zakvielchannel",
+            "ZakvielChannel",
+            " @zakvielchannel ",
+            "twitch.tv/zakvielchannel",
+            "https://www.twitch.tv/ZakvielChannel",
+            "https://m.twitch.tv/zakvielchannel/videos?filter=archives",
+        ):
+            self.assertEqual(parse_channel(text), "zakvielchannel", text)
+
+    def test_not_a_channel(self):
+        for text in (
+            None,
+            "",
+            "Заквиель",
+            "два слова",
+            "ab",
+            "x" * 26,
+            "https://www.twitch.tv/videos/2567890123",
+            "https://clips.twitch.tv/SomeClipSlug",
+            "https://example.com/zakvielchannel",
+        ):
+            self.assertIsNone(parse_channel(text), text)
+
+
+class MatchStreamerTest(unittest.TestCase):
+    def setUp(self):
+        self.zak = Row("zakvielchannel", "ZakvielChannel", "Заквиель")
+        self.other = Row("someone_else", "Someone", None)
+        self.rows = [self.zak, self.other]
+
+    def test_by_login_link_and_names(self):
+        for text in ("zakvielchannel", "https://twitch.tv/ZakvielChannel", "заквиель", "ЗАКВИЕЛЬ ", "zakvielCHANNEL"):
+            self.assertIs(match_streamer(text, self.rows), self.zak, text)
+        self.assertIs(match_streamer("someone", self.rows), self.other)
+        self.assertIs(match_streamer("@someone_else", self.rows), self.other)
+
+    def test_unknown_or_empty(self):
+        for text in (None, "", "  ", "кто-то", "zakviel", "twitch.tv/nobody_here"):
+            self.assertIsNone(match_streamer(text, self.rows), text)
+
+    def test_same_name_for_two_streamers_is_ambiguous(self):
+        twin = Row("second_channel", "Second", "Заквиель")
+        self.assertIsNone(match_streamer("Заквиель", [self.zak, twin]))
+        self.assertIs(match_streamer("second_channel", [self.zak, twin]), twin)
+
+    def test_login_wins_over_name(self):
+        # Имя одного стримера совпало с логином другого: логин однозначен
+        named = Row("first_channel", "First", "someone_else")
+        self.assertIs(match_streamer("someone_else", [named, self.other]), self.other)
+
 
 if __name__ == "__main__":
     unittest.main()

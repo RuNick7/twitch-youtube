@@ -14,7 +14,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, Telegra
 from aiogram.types import InlineKeyboardMarkup, Message, ReplyParameters
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from .config import Settings
+from .config import Settings, streamer_settings
 from .crypto import Vault
 from .db import Segment, Streamer, Vod
 from .ui import render_segment
@@ -36,13 +36,23 @@ class App:
     sync_wake: asyncio.Event = field(default_factory=asyncio.Event)  # будит раскладку роликов по плейлистам
     shorts_wake: asyncio.Event = field(default_factory=asyncio.Event)  # будит проверку клипов для Shorts
     ytdlp_version: str = "?"
-    watch_state: str = "ещё не проверялся"  # для /status
-    live_title: str | None = None  # название идущего стрима, если он идёт
+    # Для /status, по ID стримера: что видно на его канале и название идущего стрима, если он идёт
+    watch_states: dict[int, str] = field(default_factory=dict)
+    live_titles: dict[int, str] = field(default_factory=dict)
+    # Бот следит за несколькими стримерами: в сообщениях о роликах есть имя и хештег стримера,
+    # а в подсказках — команды с его логином. Обновляется при запуске, /add и /remove
+    several: bool = False
+    # Стримеры, которых владелец добавляет командой /add и ещё не подтвердил их разрешение: логин → (имя канала, имя для названий)
+    pending_adds: dict[str, tuple[str, str | None]] = field(default_factory=dict)
     tasks: set[asyncio.Task] = field(default_factory=set)
 
     @property
     def owner_id(self) -> int | None:
         return self.settings.telegram_owner_id
+
+    def config(self, streamer: Streamer) -> Settings:
+        """Настройки стримера: общие из .env с его отличиями."""
+        return streamer_settings(self.settings, streamer.overrides)
 
     def spawn(self, coro: Coroutine) -> asyncio.Task:
         """Фоновая задача; ссылка хранится, чтобы её не собрал сборщик мусора."""
@@ -86,7 +96,7 @@ class App:
                 return
             vod = await session.get(Vod, seg.vod_id)
             streamer = await session.get(Streamer, vod.streamer_id)
-        text, markup = render_segment(seg, vod, streamer, self.tz, self.settings.publish_privacy)
+        text, markup = render_segment(seg, vod, streamer, self.tz, self.config(streamer).publish_privacy, self.several)
         try:
             await self.bot.edit_message_text(
                 text=text, chat_id=self.owner_id, message_id=seg.tg_message_id, reply_markup=markup

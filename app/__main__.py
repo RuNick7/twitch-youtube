@@ -19,9 +19,10 @@ from .config import Settings
 from .consent import prompt_update
 from .context import App
 from .crypto import Vault
-from .db import get_streamer, init_db, make_engine
+from .db import adopt_legacy_state, get_streamer, init_db, make_engine
 from .refresher import Refresher
 from .shorts import ShortsScout
+from .streamers import watched
 from .tools import update_ytdlp, ytdlp_version
 from .watcher import TitleTracker, Watcher
 from .worker import Worker
@@ -51,7 +52,8 @@ async def main() -> None:
     await init_db(engine)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     async with sessions() as session, session.begin():
-        await get_streamer(session, settings.twitch_channel)
+        streamer = await get_streamer(session, settings.twitch_channel)
+        await adopt_legacy_state(session, streamer, settings.streamer_name)
 
     bot = Bot(
         settings.telegram_bot_token,
@@ -69,6 +71,7 @@ async def main() -> None:
         )
         app.ytdlp_version = await ytdlp_version()
         log.info("yt-dlp: %s", app.ytdlp_version)
+        log.info("Стримеры: %s", ", ".join(streamer.login for streamer in await watched(app)))
 
         dispatcher = Dispatcher()
         dispatcher["app"] = app
@@ -77,12 +80,10 @@ async def main() -> None:
         app.spawn(Worker(app).run())
         app.spawn(Checker(app).run())
         app.spawn(Refresher(app).run())
-        if settings.shorts:
-            app.spawn(ShortsScout(app).run())
+        # Shorts можно включить отдельному стримеру, поэтому клипы проверяются всегда
+        app.spawn(ShortsScout(app).run())
         if settings.watch_interval_sec > 0:
             app.spawn(Watcher(app).run())
-        else:
-            app.watch_state = "слежение выключено (WATCH_INTERVAL_SEC=0), только /process"
         if settings.title_poll_sec > 0:
             app.spawn(TitleTracker(app).run())
         app.spawn(keep_ytdlp_fresh(app))

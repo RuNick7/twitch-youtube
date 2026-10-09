@@ -52,11 +52,10 @@ os.environ.update(
     STREAMER_NAME="Заквиель",
     # Minecraft нумеруется: в шаге 9 его короткий кусок пропущен и не должен превратить единственную часть в «2/2»
     NO_PART_CATEGORIES="Just Chatting",
-    # Shorts ждут дольше сегментов: минута против нуля, чтобы проверить, что задержки разные
-    SHORTS_PUBLISH_DELAY_MIN="1",
 )
 
 import app.__main__ as entry  # noqa: E402
+import app.bot as bot_mod  # noqa: E402
 import app.checker as checker_mod  # noqa: E402
 import app.hls as hls  # noqa: E402
 import app.refresher as refresher_mod  # noqa: E402
@@ -68,7 +67,7 @@ import app.youtube as yt  # noqa: E402
 import httpx  # noqa: E402
 from aiogram import Bot  # noqa: E402
 from aiogram.client.session.base import BaseSession  # noqa: E402
-from sqlalchemy import delete, select, update  # noqa: E402
+from sqlalchemy import select, update  # noqa: E402
 from sqlalchemy.ext.asyncio import async_sessionmaker  # noqa: E402
 
 from app.db import (  # noqa: E402
@@ -83,6 +82,7 @@ from app.db import (  # noqa: E402
     as_utc,
     get_spans,
     get_warnings,
+    init_db,
     make_engine,
 )
 from app.tools import VodInfo, fetch_vod_info  # noqa: E402
@@ -346,6 +346,8 @@ class FakeGoogle:
         self.channel_title = "Тестовый канал"
         self.playlists: dict[str, dict] = {}
         self.playlist_seq = 0
+        self.upload_limit = False  # канал исчерпал дневной лимит загрузок
+        self.limit_refusals = 0
 
     def app(self):
         app = web.Application(client_max_size=64 * 1024**2)
@@ -411,6 +413,11 @@ class FakeGoogle:
     async def create(self, request):
         if (denied := self._auth(request)) is not None:
             return denied
+        if self.upload_limit:
+            self.limit_refusals += 1
+            return web.json_response({"error": {"code": 400, "message": "The user has exceeded the number of videos "
+                                                "they may upload.", "errors": [{"reason": "uploadLimitExceeded"}]}},
+                                     status=400)
         total = int(request.headers["X-Upload-Content-Length"])
         meta = await request.json()
         st = meta.get("status", {})
@@ -573,7 +580,7 @@ class FakeChannel:
 
     async def list_vods(self, channel, limit=5):
         if channel != "zakvielchannel":
-            raise AssertionError(channel)
+            return []  # у второго стримера эфиров нет
         self.list_calls += 1
         return [VOD_WATCH, VOD_OLD] if self.enabled else []
 
@@ -590,13 +597,13 @@ class FakeChannel:
     async def client_id(self):
         return "test-client"
 
-    async def live_state(self, http, channel, client):
-        if channel != "zakvielchannel" or client != "test-client":
-            raise AssertionError((channel, client))
+    async def live_states(self, http, logins, client):
+        if "zakvielchannel" not in logins or client != "test-client":
+            raise AssertionError((logins, client))
         self.title_calls += 1
-        if not (self.enabled and self.live):
-            return None
-        return LiveState(stream_id="stream-w", started_at=self.started, title=self.title)
+        live = self.enabled and self.live
+        state = LiveState(stream_id="stream-w", started_at=self.started, title=self.title) if live else None
+        return {login: state if login == "zakvielchannel" else None for login in logins}
 
 
 # ---------- приложение ----------
@@ -643,7 +650,7 @@ async def main():
     channel = FakeChannel(watch_info, old_info)
     watcher_mod.list_channel_vods = channel.list_vods
     watcher_mod.fetch_vod_info = channel.info
-    watcher_mod.live_state = channel.live_state
+    watcher_mod.live_states = channel.live_states
     watcher_mod.client_id = channel.client_id
 
     tg = FakeTelegram()
@@ -666,6 +673,10 @@ async def main():
     async def status_in(sid, statuses):
         row = await seg(sid)
         return row if row and row.status in statuses else None
+
+    async def streamer_row(login="zakvielchannel"):
+        async with db() as s:
+            return await s.scalar(select(Streamer).where(Streamer.login == login))
 
     async def start_app():
         before = sum("Бот запущен" in m["text"] for _, m in tg.owner_messages())
@@ -704,7 +715,23 @@ async def main():
 
     t0 = time.monotonic()
     print("\n== 1. Запуск, YouTube, пауза", flush=True)
+    # База от версии с одним стримером: пауза и начало слежения лежат в общих ключах
+    (WORK / "data").mkdir(parents=True, exist_ok=True)
+    await init_db(engine)
+    legacy_since = datetime.now(timezone.utc)
+    # Shorts этого стримера ждут после обработки минуту, а сегменты — ноль (PUBLISH_DELAY_MIN)
+    overrides = json.dumps({"shorts_publish_delay_min": 1})
+    async with db() as s, s.begin():
+        s.add(Streamer(login="zakvielchannel", overrides=overrides))
+        s.add_all([KV(key="watch_since", value=legacy_since.isoformat()), KV(key="paused", value="0")])
     task = await start_app()
+    row = await streamer_row()
+    async with db() as s:
+        legacy = (await s.scalars(select(KV))).all()
+    check(row.title_name == "Заквиель" and row.paused is False and as_utc(row.watch_since) == legacy_since
+          and not legacy and row.overrides == overrides,
+          "пауза, начало слежения и имя из STREAMER_NAME перенесены в запись стримера",
+          (row.title_name, row.paused, row.watch_since, [r.key for r in legacy], row.overrides))
     reply = await say("/youtube")
     consent = reply[-1][0]
     text = tg.messages[consent]["text"]
@@ -718,7 +745,7 @@ async def main():
     check(True, "YouTube подключён по коду")
     # Канал будто подключили до появления плейлистов: согласие дано по старой версии политики
     async with db() as s, s.begin():
-        await s.execute(update(KV).where(KV.key == "consent_version").values(value="1"))
+        await s.execute(update(Streamer).values(consent_version=1))
     reply = await say("/pause")
     check("остановлены" in reply[-1][1]["text"], "/pause")
 
@@ -979,6 +1006,8 @@ async def main():
                   "2885498731", 14305),
         clip_node("low", "LowViewsClip", "мало просмотров", 50, 10, "Portal 2", "2885498731", 100),
     ]
+    google.upload_limit = True  # канал исчерпал дневной лимит загрузок: Shorts сначала упрутся в него
+    since = tg.next_message_id
     APPS[-1].shorts_wake.set()
     rows = await wait_for(lambda: shorts_sent(3), 60, "Shorts из клипов")
     # Первый Shorts очередь может взять в загрузку раньше, чем тест прочитает статус
@@ -995,9 +1024,29 @@ async def main():
     m = tg.messages[short_a.tg_message_id]
     check("🎬 <b>Shorts</b>" in m["text"] and "просмотров на Twitch: 2037" in m["text"] and m["silent"]
           and buttons(m["markup"])[0] == "▶️ Twitch", "в Telegram карточка Shorts без звука", m["text"])
+
+    notice = await wait_for(lambda: tg.find("дневной лимит канала", since), 120, "лимит канала")
+    await asyncio.sleep(3)  # бот не должен повторять попытки, пока ждёт
+    streamer = await streamer_row()
+    queued = [(await seg(short_a.id)).status, (await seg(short_f.id)).status]
+    check(tg.messages[notice]["silent"] and google.limit_refusals == 1 and not streamer.paused
+          and streamer.uploads_wait_until is not None and queued == [Status.QUEUED, Status.QUEUED],
+          "лимит канала: Shorts ждут в очереди, бот не на паузе, пишет без звука и не повторяет попытку сразу",
+          (google.limit_refusals, streamer.paused, streamer.uploads_wait_until, queued))
+    reply = await say("/status")
+    check("⏳ YouTube не принимает новые ролики — исчерпан дневной лимит канала" in reply[-1][1]["text"],
+          "в /status видно, что загрузки ждут лимита", reply[-1][1]["text"])
+    google.upload_limit = False
+    async with db() as s, s.begin():  # время ожидания вышло
+        await s.execute(update(Streamer).values(uploads_wait_until=datetime.now(timezone.utc)))
+    APPS[-1].wake.set()
+    resumed = await wait_for(lambda: tg.find("снова принимает загрузки", since), 120, "загрузки после лимита")
+    check(tg.messages[resumed]["silent"] and (await streamer_row()).uploads_wait_until is None,
+          "когда время ожидания вышло, загрузка продолжилась сама, без /resume")
+
     waiting = await wait_for(lambda: status_in(short_a.id, (Status.WAITING,)), 300, "Shorts A обработан")
     left = (as_utc(waiting.publish_after) - datetime.now(timezone.utc)).total_seconds()
-    check(0 < left <= 60, f"Shorts ждёт публикации свою минуту (SHORTS_PUBLISH_DELAY_MIN), осталось {left:.0f} с", left)
+    check(0 < left <= 60, f"Shorts ждёт публикации свою минуту (настройка стримера), осталось {left:.0f} с", left)
     row = await wait_for(lambda: status_in(short_a.id, finals), 300, "Shorts A")
     row_f = await wait_for(lambda: status_in(short_f.id, finals), 300, "Shorts F")
     check(row.status == Status.PUBLISHED and row_f.status == Status.PUBLISHED, "Shorts опубликованы сами",
@@ -1021,15 +1070,42 @@ async def main():
     check(len(await shorts()) == 3, "повторная проверка не берёт те же клипы и соблюдает лимит на сутки")
     check(not list((WORK / "data" / "shorts").glob("*.mp4")), "после загрузки файлы Shorts удалены")
 
+    print("\n== 10в. Второй стример: своё имя, свои настройки и своя пауза", flush=True)
+    second_vod = "9990000001"
+    async with db() as s, s.begin():
+        s.add(Streamer(login="secondstreamer", display_name="SecondStreamer", title_name="Второй",
+                       overrides=json.dumps({"no_part_categories": "Just Chatting,Minecraft"})))
+    real_fetch = bot_mod.fetch_vod_info
+
+    async def fetch_second(vod_id):
+        if vod_id != second_vod:
+            return await real_fetch(vod_id)
+        return VodInfo(id=second_vod, title="Второй стрим", duration=3600, uploader="SecondStreamer",
+                       uploader_login="secondstreamer", started_at=datetime(2026, 9, 29, tzinfo=timezone.utc),
+                       is_live=False, chapters=[{"start_time": 0, "end_time": 1800, "title": "Minecraft"},
+                                                {"start_time": 1800, "end_time": 3600, "title": "Dota 2"}])
+
+    bot_mod.fetch_vod_info = fetch_second
+    since = tg.next_message_id
+    tg.push_text(OWNER, f"/process https://www.twitch.tv/videos/{second_vod}")
+    rows = await wait_for(lambda: all_sent(second_vod), 60, "сегменты второго стримера")
+    check([r.title for r in rows] == ["Minecraft | Второй стрим | Второй", "Dota 2 | Второй стрим | Часть 1 | Второй"],
+          "у второго стримера своё имя, свои категории без номера и своя нумерация частей", [r.title for r in rows])
+    notice = await wait_for(lambda: tg.find("YouTube-канал не подключён", since), 60, "второй стример без канала")
+    second, first = await streamer_row("secondstreamer"), await streamer_row()
+    check(second.paused and not first.paused and [r.status for r in await segs(second_vod)] == [Status.QUEUED] * 2
+          and tg.messages[notice]["reply_to"] == rows[0].tg_message_id,
+          "у второго стримера нет YouTube-канала: на паузе только он, Заквиель работает дальше",
+          (second.paused, first.paused))
+    check(await eventually(lambda: "стрима нет" in APPS[-1].watch_states.get(second.id, ""))
+          and (await streamer_row("secondstreamer")).watch_since is not None,
+          "за каналом второго стримера тоже следят, со своего момента", APPS[-1].watch_states)
+
     print("\n== 11. Ежедневная сверка, отключение канала и отзыв доступа", flush=True)
 
     async def run_daily_check():
         async with db() as s, s.begin():
-            await s.execute(delete(KV).where(KV.key == refresher_mod.CHECKED_KEY))
-
-    async def streamer_row():
-        async with db() as s:
-            return (await s.scalars(select(Streamer))).one()
+            await s.execute(update(Streamer).values(youtube_checked_at=None))
 
     uploaded = [s_mc.id, n_jc.id, n_mc.id, s_jc.id, w_mc.id, w_jc.id]
     google.videos.pop((await seg(s_mc.id)).youtube_id)  # отклонённый ролик удалили в YouTube Studio
@@ -1070,19 +1146,18 @@ async def main():
     async with db() as s:
         leftovers = (await s.scalars(select(Segment).where(
             (Segment.youtube_id.is_not(None)) | (Segment.upload_uri.is_not(None))))).all()
-        paused = await s.get(KV, "paused")
     check(not leftovers and all(r.status == Status.FORGOTTEN for r in rows),
           "ID роликов и сессий загрузки удалены", [(r.status, r.youtube_id) for r in rows])
-    check(paused and paused.value == "1", "после отключения обработка на паузе")
+    check(streamer.paused, "после отключения обработка на паузе")
     async with db() as s:
         left = (await s.scalars(select(Playlist))).all()
-        agreed = await s.get(KV, "consent_version")
-    check(not left and agreed is None, "ID плейлистов и согласие тоже удалены", (left, agreed))
+    check(not left and streamer.consent_version is None and streamer.consent_prompted is None,
+          "ID плейлистов и согласие тоже удалены", (left, streamer.consent_version, streamer.consent_prompted))
     check(buttons(tg.messages[s_jc.tg_message_id]["markup"]) == ["▶️ Twitch"],
           "под роликом, ждавшим решения, остались только ссылки", buttons(tg.messages[s_jc.tg_message_id]["markup"]))
 
     since = tg.next_message_id
-    reply = await say("/youtube")
+    reply = await say("/youtube zakvielchannel")  # стримеров уже двое: без имени бот спросил бы, чей канал
     await press(reply[-1][0], "✅")
     mid = await wait_for(lambda: tg.find("Подключён канал", since), 30, "повторное подключение")
     check("/resume" in tg.messages[mid]["text"], "после подключения бот напоминает, что обработка на паузе")
