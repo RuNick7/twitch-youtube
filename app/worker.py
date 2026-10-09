@@ -17,7 +17,7 @@ from .hls import Plan, SourceError, build_plan, stream
 from .service import DISCONNECTED_REASON, build_metadata, update_segment
 from .shorts import file_stream, prepare_short, short_metadata
 from .tools import fetch_vod_info
-from .ui import local_time
+from .ui import command_for, local_time, streamer_prefix
 from .youtube import LIMIT_REASONS, AuthError, StreamFactory, YouTubeError
 
 log = logging.getLogger(__name__)
@@ -113,7 +113,7 @@ class Worker:
             streamer = await session.get(Streamer, vod.streamer_id)
         try:
             if not streamer.youtube_token:
-                raise Blocked("YouTube-канал не подключён. Выполните /youtube, затем /resume")
+                raise Blocked(f"YouTube-канал не подключён. {self._reconnect(streamer)}")
             refresh_token = app.vault.decrypt(streamer.youtube_token)
             await update_segment(app, segment_id, status=Status.UPLOADING, error=None)
             await app.refresh_segment(segment_id)
@@ -145,7 +145,8 @@ class Worker:
             await update_segment(app, segment_id, status=Status.QUEUED)
             await set_paused(app, True, streamer.id)
             await app.refresh_segment(segment_id)
-            await app.notify(f"🔴 Обработка на паузе: {escape(str(exc))}", reply_to=seg.tg_message_id)
+            who = streamer_prefix(streamer, app.several)
+            await app.notify(f"🔴 {who}Обработка на паузе: {escape(str(exc))}", reply_to=seg.tg_message_id)
             return
         except LimitReached as exc:
             await update_segment(app, segment_id, status=Status.QUEUED)
@@ -224,6 +225,11 @@ class Worker:
             channel = escape(streamer.youtube_channel_title or streamer.public_name)
             await self.app.notify(f"▶️ YouTube снова принимает загрузки на канал «{channel}».", silent=True)
 
+    def _reconnect(self, streamer: Streamer) -> str:
+        """Что сделать владельцу, чтобы загрузка пошла снова; когда стримеров несколько — команды с логином."""
+        several = self.app.several
+        return f"Выполните {command_for('/youtube', streamer, several)}, затем {command_for('/resume', streamer, several)}"
+
     async def _connected(self, streamer: Streamer) -> bool:
         """Подключён ли ещё канал, на который шла загрузка. Повторный вход в тот же канал — не отключение."""
         async with self.app.sessions() as session:
@@ -301,10 +307,11 @@ class Worker:
                 limit_mbit=app.settings.upload_limit_mbit,
             )
         except AuthError as exc:
-            raise Blocked("доступ к YouTube отозван или истёк. Выполните /youtube, затем /resume") from exc
+            raise Blocked(f"доступ к YouTube отозван или истёк. {self._reconnect(streamer)}") from exc
         except YouTubeError as exc:
             if exc.reason in LIMIT_REASONS:
                 raise LimitReached(exc.reason) from exc
             if exc.reason == "youtubeSignupRequired":
-                raise Blocked("у Google-аккаунта нет YouTube-канала: создайте канал и выполните /youtube") from exc
+                connect = command_for("/youtube", streamer, app.several)
+                raise Blocked(f"у Google-аккаунта нет YouTube-канала: создайте канал и выполните {connect}") from exc
             raise

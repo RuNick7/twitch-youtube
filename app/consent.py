@@ -10,7 +10,7 @@ from __future__ import annotations
 from sqlalchemy import update
 
 from .context import App
-from .db import Streamer, find_streamer
+from .db import Streamer, all_streamers
 from .ui import accept_action, confirm_keyboard, render_consent
 
 # 1 — загрузка и публикация роликов, 2 — плейлисты по категориям, 3 — Shorts из клипов
@@ -39,22 +39,21 @@ async def accept(app: App, streamer_id: int, version: int = CONSENT_VERSION) -> 
 
 
 async def prompt_update(app: App) -> None:
-    """Если канал подключён по старой версии политики, один раз просит принять новую."""
+    """Если канал подключён по старой версии политики, один раз просит принять новую. Согласие у каждого канала своё."""
     async with app.sessions() as session:
-        streamer = await find_streamer(session, app.settings.twitch_channel)
-    if not (streamer and streamer.youtube_token) or streamer.consent_prompted == CONSENT_VERSION:
-        return
-    accepted = accepted_version(streamer)
-    if accepted >= CONSENT_VERSION:
-        return
-    name = streamer.display_name or streamer.login
-    changes = [text for version, text in sorted(CHANGES.items()) if version > accepted]
-    message = await app.notify(
-        render_consent(app.config(streamer), name, changes=changes),
-        markup=confirm_keyboard("✅ Принимаю", accept_action(CONSENT_VERSION)),
-    )
-    if message:
-        async with app.sessions() as session, session.begin():
-            await session.execute(
-                update(Streamer).where(Streamer.id == streamer.id).values(consent_prompted=CONSENT_VERSION)
-            )
+        streamers = await all_streamers(session, connected=True)
+    for streamer in streamers:
+        accepted = accepted_version(streamer)
+        if streamer.consent_prompted == CONSENT_VERSION or accepted >= CONSENT_VERSION:
+            continue
+        name = streamer.display_name or streamer.login
+        changes = [text for version, text in sorted(CHANGES.items()) if version > accepted]
+        message = await app.notify(
+            render_consent(app.config(streamer), name, changes=changes),
+            markup=confirm_keyboard("✅ Принимаю", accept_action(CONSENT_VERSION), streamer.id),
+        )
+        if message:
+            async with app.sessions() as session, session.begin():
+                await session.execute(
+                    update(Streamer).where(Streamer.id == streamer.id).values(consent_prompted=CONSENT_VERSION)
+                )

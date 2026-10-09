@@ -7,7 +7,7 @@ try:
     from sqlalchemy import select
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
-    from app.db import KV, Streamer, adopt_legacy_state, as_utc, get_streamer, init_db, make_engine
+    from app.db import KV, Streamer, adopt_legacy_state, all_streamers, as_utc, get_streamer, init_db, make_engine
 except ImportError:  # без зависимостей из requirements.txt: эти тесты идут в тестовом образе
     raise unittest.SkipTest("нужны SQLAlchemy и aiosqlite")
 
@@ -62,6 +62,27 @@ class LegacyStateTest(unittest.IsolatedAsyncioTestCase):
         streamer, keys = await self.adopt("Другое имя")
         self.assertEqual((streamer.paused, streamer.title_name), (True, "Заквиель"))
         self.assertEqual(keys, ["other"])
+
+    async def watched(self):
+        async with self.sessions() as session:
+            return [streamer.login for streamer in await all_streamers(session, watched=True)]
+
+    async def test_rows_left_from_old_settings_are_not_watched(self):
+        async with self.engine.begin() as conn:  # строка осталась от прежнего значения TWITCH_CHANNEL
+            await conn.exec_driver_sql("INSERT INTO streamers (login) VALUES ('old_channel')")
+        await self.adopt("Заквиель")
+        self.assertEqual(await self.watched(), ["zakvielchannel"])
+        async with self.sessions() as session:
+            self.assertEqual(len(await all_streamers(session)), 2)  # строка не удалена, её можно вернуть через /add
+
+    async def test_streamers_added_in_bot_survive_rollback_and_upgrade(self):
+        await self.adopt("Заквиель")
+        async with self.sessions() as session, session.begin():
+            added = await get_streamer(session, "newcomer")
+            added.permitted_at = datetime(2026, 10, 9, tzinfo=timezone.utc)  # так отмечает /add
+            session.add(KV(key="paused", value="0"))  # откат: старая версия бота снова записала ключ
+        await self.adopt("Заквиель")
+        self.assertEqual(await self.watched(), ["zakvielchannel", "newcomer"])
 
     async def test_new_streamer_has_no_legacy_state(self):
         async with self.sessions() as session, session.begin():

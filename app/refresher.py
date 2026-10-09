@@ -18,6 +18,7 @@ from .context import App
 from .db import Segment, Status, Streamer, Vod, utcnow
 from .playlists import sync_playlists, verify_playlists
 from .service import DELETED_REASON, PUBLISHABLE, REVOKED_REASON, YOUTUBE_FIELDS, forget_youtube, set_status
+from .ui import command_for, streamer_prefix
 from .worker import set_paused
 from .youtube import AuthError, YouTubeError
 
@@ -99,8 +100,9 @@ class Refresher:
             await set_paused(app, True, streamer.id)
             await forget_youtube(app, streamer.id, REVOKED_REASON)
             await app.notify(
-                "🔴 Доступ к YouTube отозван. AutoVOD удалил сохранённые данные: токен, ID и название канала, "
-                "ID и состояние роликов. Сами ролики на YouTube не тронуты. Подключить канал снова — /youtube"
+                f"🔴 {streamer_prefix(streamer, app.several)}Доступ к YouTube отозван. AutoVOD удалил сохранённые "
+                "данные: токен, ID и название канала, ID и состояние роликов. Сами ролики на YouTube не тронуты. "
+                f"Подключить канал снова — {command_for('/youtube', streamer, app.several)}"
             )
             return True
         except (YouTubeError, httpx.HTTPError) as exc:

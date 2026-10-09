@@ -93,7 +93,12 @@ async def ingest_vod(app: App, info: VodInfo, login: str | None = None) -> int:
     async with app.sessions() as session:
         streamer = await find_streamer(session, channel) if channel else None
     if streamer is None:
-        raise IngestError(f"VOD с канала {channel or '(неизвестного)'}, а такого стримера в боте нет")
+        raise IngestError(
+            f"VOD с канала {channel or '(неизвестного)'}, а такого стримера в боте нет"
+            + (f". Добавить: /add {channel}" if channel else "")
+        )
+    if streamer.removed_at is not None:
+        raise IngestError(f"стример {channel} убран. Вернуть: /add {channel}")
     settings = app.config(streamer)
 
     chapters = split_by_titles(normalize_chapters(info.chapters, info.duration), await title_marks(app, info, channel))
@@ -160,9 +165,9 @@ async def ingest_vod(app: App, info: VodInfo, login: str | None = None) -> int:
             )
         session.add_all(segments)
 
-    await app.notify(render_vod_header(vod, streamer, segments, app.tz), silent=True)
+    await app.notify(render_vod_header(vod, streamer, segments, app.tz, app.several), silent=True)
     for seg in segments:
-        text, markup = render_segment(seg, vod, streamer, app.tz, settings.publish_privacy)
+        text, markup = render_segment(seg, vod, streamer, app.tz, settings.publish_privacy, app.several)
         message = await app.notify(text, markup=markup, silent=True)
         if message:
             await update_segment(app, seg.id, tg_message_id=message.message_id)
@@ -299,11 +304,14 @@ async def forget_youtube(app: App, streamer_id: int, reason: str) -> None:
         await app.refresh_segment(segment_id)
 
 
-async def status_counts(app: App, kind: str | None = None) -> dict[str, int]:
-    """Число сегментов (kind=None) или Shorts (kind=SHORT) по статусам."""
+async def status_counts(app: App, kind: str | None = None, streamer_id: int | None = None) -> dict[str, int]:
+    """Число сегментов (kind=None) или Shorts (kind=SHORT) по статусам: всех или одного стримера."""
     condition = Segment.kind.is_(None) if kind is None else Segment.kind == kind
+    query = select(Segment.status, func.count()).where(condition).group_by(Segment.status)
+    if streamer_id is not None:
+        query = query.join(Vod, Vod.id == Segment.vod_id).where(Vod.streamer_id == streamer_id)
     async with app.sessions() as session:
-        rows = await session.execute(select(Segment.status, func.count()).where(condition).group_by(Segment.status))
+        rows = await session.execute(query)
     return {status: count for status, count in rows.all()}
 
 

@@ -14,7 +14,7 @@ from .checks import FAILED, READY, REJECTED, failure_reason, processing_state, y
 from .context import App
 from .db import SHORT, Segment, Status, Streamer, Vod, as_utc, dump_warnings, get_warnings, utcnow
 from .service import MONITOR_EVERY, publish, update_segment
-from .ui import PRIVACY_NAMES
+from .ui import PRIVACY_NAMES, command_for, streamer_prefix
 from .worker import is_paused, set_paused
 from .youtube import AuthError, YouTubeError
 
@@ -90,8 +90,10 @@ class Checker:
         self.skip_until[streamer.id] = utcnow() + AUTH_BACKOFF
         if not await is_paused(self.app, streamer.id):
             await set_paused(self.app, True, streamer.id)
+            several = self.app.several
             await self.app.notify(
-                "🔴 Обработка на паузе: доступ к YouTube отозван или истёк. Выполните /youtube, затем /resume"
+                f"🔴 {streamer_prefix(streamer, several)}Обработка на паузе: доступ к YouTube отозван или истёк. "
+                f"Выполните {command_for('/youtube', streamer, several)}, затем {command_for('/resume', streamer, several)}"
             )
 
     async def check(self, seg: Segment, item: dict | None, streamer: Streamer) -> None:

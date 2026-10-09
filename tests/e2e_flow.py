@@ -1157,7 +1157,7 @@ async def main():
           "под роликом, ждавшим решения, остались только ссылки", buttons(tg.messages[s_jc.tg_message_id]["markup"]))
 
     since = tg.next_message_id
-    reply = await say("/youtube")
+    reply = await say("/youtube zakvielchannel")  # стримеров уже двое: без имени бот спросил бы, чей канал
     await press(reply[-1][0], "✅")
     mid = await wait_for(lambda: tg.find("Подключён канал", since), 30, "повторное подключение")
     check("/resume" in tg.messages[mid]["text"], "после подключения бот напоминает, что обработка на паузе")

@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timezone
 
 try:
-    from app.config import Settings, streamer_settings
+    from app.config import Settings, change_override, describe_settings, streamer_settings
     from app.twitch import TwitchError, live_states
 except ImportError:  # без зависимостей из requirements.txt: эти тесты идут в тестовом образе
     raise unittest.SkipTest("нужны pydantic-settings и httpx")
@@ -66,6 +66,47 @@ class FakeHttp:
     async def post(self, url, content, headers, timeout):
         self.requests.append(json.loads(content))
         return FakeResponse({"data": {"users": self.users}})
+
+
+class ChangeOverrideTest(unittest.TestCase):
+    """Команда /set: текст из сообщения становится проверенным значением в Streamer.overrides."""
+
+    def test_number_and_name_in_any_case(self):
+        self.assertEqual(json.loads(change_override(None, "SHORTS_MIN_VIEWS", " 300 ")), {"shorts_min_views": 300})
+
+    def test_yes_and_no_in_russian_and_english(self):
+        for text, expected in (("нет", False), ("да", True), ("false", False), ("ВКЛ", True), ("выкл", False)):
+            self.assertEqual(json.loads(change_override(None, "shorts", text)), {"shorts": expected}, text)
+
+    def test_text_with_spaces_and_commas(self):
+        changed = change_override(None, "skip_title_keywords", "сериал, фильм, кино")
+        self.assertEqual(streamer_settings(base_settings(), changed).keywords, ["сериал", "фильм", "кино"])
+
+    def test_other_settings_are_kept_and_reset_returns_common(self):
+        both = change_override(change_override(None, "shorts_per_day", "3"), "publish_privacy", "unlisted")
+        self.assertEqual(json.loads(both), {"shorts_per_day": 3, "publish_privacy": "unlisted"})
+        one = change_override(both, "shorts_per_day", None)
+        self.assertEqual(json.loads(one), {"publish_privacy": "unlisted"})
+        self.assertIsNone(change_override(one, "publish_privacy", None))
+        self.assertIsNone(change_override(None, "shorts_per_day", None))
+
+    def test_wrong_values_and_names_are_rejected(self):
+        for name, text in (
+            ("shorts_per_day", "много"),
+            ("shorts_per_day", "-5"),
+            ("publish_privacy", "secret"),
+            ("auto_publish", "может быть"),
+            ("upload_limit_mbit", "50"),  # общая настройка: стримеру отдельно не задаётся
+            ("нет_такой", "1"),
+        ):
+            with self.assertRaises(ValueError, msg=f"{name}={text}"):
+                change_override(None, name, text)
+
+    def test_describe_marks_own_settings(self):
+        rows = {name: (value, own) for name, value, own in describe_settings(base_settings(), '{"shorts_min_views": 300}')}
+        self.assertEqual(rows["shorts_min_views"], (300, True))
+        self.assertEqual(rows["shorts_per_day"], (2, False))
+        self.assertNotIn("upload_limit_mbit", rows)
 
 
 LIVE = {"login": "zakvielchannel", "stream": {"id": "1", "createdAt": "2026-10-02T13:13:00Z"},

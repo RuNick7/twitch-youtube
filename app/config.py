@@ -147,6 +147,39 @@ def streamer_settings(settings: Settings, overrides: str | None) -> Settings:
     return settings.model_copy(update=values) if values else settings
 
 
+_WORDS = {"да": True, "вкл": True, "нет": False, "выкл": False}
+
+
+def change_override(overrides: str | None, name: str, value: str | None) -> str | None:
+    """Новое значение Streamer.overrides после команды /set: value — текст из сообщения, None — вернуть общее.
+
+    ValueError — такой настройки у стримера нет или значение ей не подходит.
+    """
+    name = name.strip().lower()
+    adapter = _ADAPTERS.get(name)
+    if adapter is None:
+        raise ValueError(f"настройки {name} нет среди тех, что задаются стримеру отдельно")
+    values = dict(_parse_overrides(overrides)) if overrides else {}
+    if value is None:
+        values.pop(name, None)
+    else:
+        text = value.strip()
+        try:
+            parsed = adapter.validate_python(_WORDS.get(text.lower(), text))
+        except ValidationError as exc:
+            raise ValueError(f"значение «{text}» не подходит: {exc.errors()[0]['msg']}") from exc
+        if isinstance(parsed, int) and not isinstance(parsed, bool) and parsed < 0:
+            raise ValueError("число не может быть отрицательным")
+        values[name] = parsed
+    return json.dumps(values, ensure_ascii=False) if values else None
+
+
+def describe_settings(settings: Settings, overrides: str | None) -> list[tuple[str, object, bool]]:
+    """Настройки стримера для /set: (имя, действующее значение, задано ли оно стримеру отдельно)."""
+    own = dict(_parse_overrides(overrides)) if overrides else {}
+    return [(name, own.get(name, getattr(settings, name)), name in own) for name in STREAMER_FIELDS]
+
+
 @lru_cache(maxsize=64)
 def _parse_overrides(text: str) -> tuple[tuple[str, object], ...]:
     """Проверенные отличия. Неизвестные настройки и неверные значения пропускаются с предупреждением в логе."""

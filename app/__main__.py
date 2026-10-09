@@ -22,6 +22,7 @@ from .crypto import Vault
 from .db import adopt_legacy_state, get_streamer, init_db, make_engine
 from .refresher import Refresher
 from .shorts import ShortsScout
+from .streamers import watched
 from .tools import update_ytdlp, ytdlp_version
 from .watcher import TitleTracker, Watcher
 from .worker import Worker
@@ -70,6 +71,7 @@ async def main() -> None:
         )
         app.ytdlp_version = await ytdlp_version()
         log.info("yt-dlp: %s", app.ytdlp_version)
+        log.info("Стримеры: %s", ", ".join(streamer.login for streamer in await watched(app)))
 
         dispatcher = Dispatcher()
         dispatcher["app"] = app

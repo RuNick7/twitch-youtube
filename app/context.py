@@ -39,6 +39,11 @@ class App:
     # Для /status, по ID стримера: что видно на его канале и название идущего стрима, если он идёт
     watch_states: dict[int, str] = field(default_factory=dict)
     live_titles: dict[int, str] = field(default_factory=dict)
+    # Бот следит за несколькими стримерами: в сообщениях о роликах есть имя и хештег стримера,
+    # а в подсказках — команды с его логином. Обновляется при запуске, /add и /remove
+    several: bool = False
+    # Стримеры, которых владелец добавляет командой /add и ещё не подтвердил их разрешение: логин → (имя канала, имя для названий)
+    pending_adds: dict[str, tuple[str, str | None]] = field(default_factory=dict)
     tasks: set[asyncio.Task] = field(default_factory=set)
 
     @property
@@ -91,7 +96,7 @@ class App:
                 return
             vod = await session.get(Vod, seg.vod_id)
             streamer = await session.get(Streamer, vod.streamer_id)
-        text, markup = render_segment(seg, vod, streamer, self.tz, self.config(streamer).publish_privacy)
+        text, markup = render_segment(seg, vod, streamer, self.tz, self.config(streamer).publish_privacy, self.several)
         try:
             await self.bot.edit_message_text(
                 text=text, chat_id=self.owner_id, message_id=seg.tg_message_id, reply_markup=markup

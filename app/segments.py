@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 # YouTube принимает ролики до 12 часов; делим всё, что длиннее 11 ч 50 мин
 SPLIT_LIMIT_SEC = 12 * 3600 - 10 * 60
@@ -457,3 +457,41 @@ def parse_vod_id(text: Optional[str]) -> Optional[str]:
         return match.group(1)
     match = _VOD_ID.fullmatch(text)
     return match.group(1) if match else None
+
+
+# --- стримеры ---
+
+_CHANNEL_URL = re.compile(r"(?<![\w.-])(?:www\.|m\.)?twitch\.tv/([A-Za-z0-9_]+)", re.IGNORECASE)
+_CHANNEL_LOGIN = re.compile(r"@?([A-Za-z0-9_]+)")
+# Разделы сайта Twitch, которые стоят в ссылке на месте логина
+_NOT_CHANNELS = {"videos", "video", "directory", "settings", "search", "downloads", "subscriptions", "inventory", "drops"}
+
+
+def parse_channel(text: Optional[str]) -> Optional[str]:
+    """Логин канала из ссылки twitch.tv/<логин> или из самого логина (можно с @). None — это не канал."""
+    text = (text or "").strip()
+    match = _CHANNEL_URL.search(text) or _CHANNEL_LOGIN.fullmatch(text)
+    if not match:
+        return None
+    login = match.group(1).lower()
+    # На Twitch логин — от 3 до 25 латинских букв, цифр и подчёркиваний
+    if login in _NOT_CHANNELS or not 3 <= len(login) <= 25:
+        return None
+    return login
+
+
+def match_streamer(text: Optional[str], streamers: Sequence):
+    """Стример, которого назвал владелец: по логину, ссылке на канал или имени.
+
+    У стримеров нужны поля login, display_name и title_name. None — никто не подошёл
+    или под имя подходят несколько.
+    """
+    query = _fold(clean_line(text))
+    if not query:
+        return None
+    login = parse_channel(text)
+    for streamer in streamers:
+        if login and streamer.login == login:
+            return streamer
+    named = [s for s in streamers if query in (_fold(s.title_name), _fold(s.display_name))]
+    return named[0] if len(named) == 1 else None

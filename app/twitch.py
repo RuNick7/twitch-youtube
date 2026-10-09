@@ -24,6 +24,7 @@ USERS_QUERY = (
     "query($logins: [String!]) { users(logins: $logins) { login stream { id createdAt } broadcastSettings { title } } }"
 )
 USERS_PER_QUERY = 50
+NAME_QUERY = "query($login: String!) { user(login: $login) { login displayName } }"
 # Клипы за последние 7 дней, самые просматриваемые первыми
 CLIPS_QUERY = (
     "query($login: String!) { user(login: $login) { clips(first: 50, criteria: {period: LAST_WEEK, sort: VIEWS_DESC}) "
@@ -81,6 +82,12 @@ async def _user(http: httpx.AsyncClient, query: str, channel: str, client: str) 
     if user is None:
         raise TwitchError(f"канала {channel} нет на Twitch")
     return user
+
+
+async def channel_display_name(http: httpx.AsyncClient, channel: str, client: str) -> str:
+    """Название канала, как его видят зрители. TwitchError — такого канала нет или Twitch не ответил."""
+    user = await _user(http, NAME_QUERY, channel, client)
+    return str(user.get("displayName") or user.get("login") or channel)
 
 
 async def popular_clips(http: httpx.AsyncClient, channel: str, client: str) -> list[dict]:

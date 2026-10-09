@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import BigInteger, ForeignKey, String, Text, UniqueConstraint, delete, event, select
+from sqlalchemy import BigInteger, ForeignKey, String, Text, UniqueConstraint, delete, event, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -53,6 +53,10 @@ class Streamer(Base):
     overrides: Mapped[str | None] = mapped_column(Text)
     paused: Mapped[bool | None]  # загрузка и публикация остановлены: /pause или пропал доступ к YouTube
     watch_since: Mapped[datetime | None]  # эфиры, закончившиеся раньше, слежение не трогает
+    # Владелец бота подтвердил, что стример разрешил делать нарезки (/add)
+    permitted_at: Mapped[datetime | None]
+    # Убран командой /remove: бот не следит за каналом и клипами, а ролики, которые уже в работе, доводит до конца
+    removed_at: Mapped[datetime | None]
     youtube_channel_id: Mapped[str | None] = mapped_column(String(64))
     youtube_channel_title: Mapped[str | None] = mapped_column(String(256))
     youtube_token: Mapped[str | None] = mapped_column(Text)  # refresh-токен, зашифрован
@@ -229,11 +233,14 @@ async def find_streamer(session: AsyncSession, login: str) -> Streamer | None:
     return await session.scalar(select(Streamer).where(Streamer.login == login.lower()))
 
 
-async def all_streamers(session: AsyncSession, connected: bool = False) -> list[Streamer]:
-    """Все стримеры в порядке добавления; connected — только с подключённым YouTube-каналом."""
+async def all_streamers(session: AsyncSession, connected: bool = False, watched: bool = False) -> list[Streamer]:
+    """Все стримеры в порядке добавления; connected — только с подключённым YouTube-каналом,
+    watched — только те, за чьим каналом бот следит (не убраны командой /remove)."""
     query = select(Streamer).order_by(Streamer.id)
     if connected:
         query = query.where(Streamer.youtube_token.is_not(None))
+    if watched:
+        query = query.where(Streamer.removed_at.is_(None))
     return list((await session.scalars(query)).all())
 
 
@@ -265,6 +272,7 @@ async def adopt_legacy_state(session: AsyncSession, streamer: Streamer, title_na
     с политикой, начало слежения и время сверки с YouTube из KV, имя для названий из STREAMER_NAME.
 
     Перенесённые ключи удаляются, уже заполненные поля не перезаписываются: повторный вызов ничего не меняет.
+    Строки других каналов, оставшиеся от прежних значений TWITCH_CHANNEL, при переносе помечаются убранными.
     """
     legacy = {row.key: row.value for row in (await session.scalars(select(KV).where(KV.key.in_(LEGACY_KEYS)))).all()}
     if "paused" in legacy and streamer.paused is None:
@@ -277,6 +285,14 @@ async def adopt_legacy_state(session: AsyncSession, streamer: Streamer, title_na
             setattr(streamer, key, _parse_time(legacy[key]))
     if legacy:
         await session.execute(delete(KV).where(KV.key.in_(LEGACY_KEYS)))
+        # Раньше бот следил только за каналом из TWITCH_CHANNEL. Строки других каналов остались от прежних
+        # значений этой настройки, и следить за ними бот не должен; вернуть такой канал можно командой /add.
+        # Стримеров, добавленных через /add (у них отмечено разрешение), это не касается
+        await session.execute(
+            update(Streamer)
+            .where(Streamer.id != streamer.id, Streamer.removed_at.is_(None), Streamer.permitted_at.is_(None))
+            .values(removed_at=utcnow())
+        )
     if title_name and not streamer.title_name:
         streamer.title_name = title_name
 

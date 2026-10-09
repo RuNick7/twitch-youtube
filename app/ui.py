@@ -16,6 +16,8 @@ from .segments import fmt_duration, fmt_spans, twitch_time_param
 
 PUBLISH, KEEP, RETRY, FORCE = "pub", "keep", "rt", "force"
 CONNECT, ACCEPT, DISCONNECT, CANCEL = "on", "accept", "off", "cancel"
+# Выбор стримера, когда их несколько: после него бот показывает условия подключения или отключения
+ASK_CONNECT, ASK_DISCONNECT = "askon", "askoff"
 
 YOUTUBE_TERMS_URL = "https://www.youtube.com/t/terms"
 GOOGLE_PRIVACY_URL = "https://www.google.com/policies/privacy"
@@ -39,24 +41,76 @@ class SegmentAction(CallbackData, prefix="seg"):
     id: int
 
 
-class YouTubeAction(CallbackData, prefix="yt"):
+class StreamerAction(CallbackData, prefix="st"):
+    """Кнопка про YouTube-канал стримера: id — стример."""
+
     action: str
+    id: int
+
+
+class YouTubeAction(CallbackData, prefix="yt"):
+    """Такие кнопки стоят под сообщениями, отправленными, когда стример был один. Новые — StreamerAction."""
+
+    action: str
+
+
+class AddAction(CallbackData, prefix="add"):
+    """Подтверждение, что стример разрешил нарезки: после него стример добавляется. yes — «да» или «нет»."""
+
+    login: str
+    yes: bool
 
 
 def _button(text: str, action: str, segment_id: int) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=SegmentAction(action=action, id=segment_id).pack())
 
 
-def confirm_keyboard(text: str, action: str) -> InlineKeyboardMarkup:
-    """Подтверждение подключения или отключения канала."""
+def _streamer_button(text: str, action: str, streamer_id: int) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=StreamerAction(action=action, id=streamer_id).pack())
+
+
+def confirm_keyboard(text: str, action: str, streamer_id: int) -> InlineKeyboardMarkup:
+    """Подтверждение подключения или отключения канала стримера."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_streamer_button(text, action, streamer_id), _streamer_button("Отмена", CANCEL, streamer_id)]
+        ]
+    )
+
+
+def streamer_keyboard(streamers: list[Streamer], action: str) -> InlineKeyboardMarkup:
+    """По кнопке на стримера: команду дали без имени, а стримеров несколько."""
+    rows = [[_streamer_button(streamer.public_name[:40], action, streamer.id)] for streamer in streamers]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def permission_keyboard(login: str) -> InlineKeyboardMarkup:
+    """Перед добавлением стримера: есть ли его разрешение на нарезки."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text=text, callback_data=YouTubeAction(action=action).pack()),
-                InlineKeyboardButton(text="Отмена", callback_data=YouTubeAction(action=CANCEL).pack()),
+                InlineKeyboardButton(
+                    text="✅ Разрешение есть, добавить", callback_data=AddAction(login=login, yes=True).pack()
+                ),
+                InlineKeyboardButton(text="Отмена", callback_data=AddAction(login=login, yes=False).pack()),
             ]
         ]
     )
+
+
+def command_for(command: str, streamer: Streamer, several: bool) -> str:
+    """Команда про стримера: /youtube, а когда стримеров несколько — /youtube <логин>."""
+    return f"{command} {streamer.login}" if several else command
+
+
+def streamer_tag(streamer: Streamer) -> str:
+    """Имя и хештег стримера для сообщений: по хештегу в чате находятся все его ролики."""
+    return f"{escape(streamer.public_name)} #{streamer.login}"
+
+
+def streamer_prefix(streamer: Streamer, several: bool) -> str:
+    """Начало сообщения о канале стримера, когда стримеров несколько: «Имя #логин · »."""
+    return f"{streamer_tag(streamer)} · " if several else ""
 
 
 def render_consent(settings: Settings, streamer_name: str, changes: list[str] | None = None) -> str:
@@ -116,9 +170,11 @@ def render_consent(settings: Settings, streamer_name: str, changes: list[str] | 
     )
 
 
-def render_disconnect(channel_title: str) -> str:
+def render_disconnect(channel_title: str, streamer_name: str = "") -> str:
+    """streamer_name — чей это канал; указывается, когда стримеров несколько."""
+    whose = f" стримера {escape(streamer_name)}" if streamer_name else ""
     return (
-        f"Отключить YouTube-канал «{escape(channel_title)}»?\n\n"
+        f"Отключить YouTube-канал «{escape(channel_title)}»{whose}?\n\n"
         "AutoVOD отзовёт доступ в Google и удалит из своей базы токен, ID и название канала, ID и состояние "
         "загруженных роликов. Сами ролики останутся на YouTube: удалить их можно в YouTube Studio. "
         "Загрузка и публикация встанут на паузу до нового подключения."
@@ -193,10 +249,11 @@ def status_line(seg: Segment, tz: ZoneInfo, privacy: str) -> str:
     return seg.status
 
 
-def render_short(seg: Segment, tz: ZoneInfo, privacy: str) -> str:
+def render_short(seg: Segment, tz: ZoneInfo, privacy: str, tag: str = "") -> str:
     author = f", автор {escape(seg.clip_author)}" if seg.clip_author else ""
     lines = [
         f"🎬 <b>Shorts</b> · {escape(seg.category)} · {seg.end - seg.start} с",
+        *([tag] if tag else []),
         f"Клип «{escape(seg.clip_title or '')}» от {local_time(seg.clip_created_at, tz)}{author}, "
         f"просмотров на Twitch: {seg.clip_views or 0}",
         f"Название: {escape(seg.title)}",
@@ -208,10 +265,12 @@ def render_short(seg: Segment, tz: ZoneInfo, privacy: str) -> str:
 
 
 def render_segment(
-    seg: Segment, vod: Vod, streamer: Streamer, tz: ZoneInfo, privacy: str
+    seg: Segment, vod: Vod, streamer: Streamer, tz: ZoneInfo, privacy: str, several: bool = False
 ) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Сообщение о сегменте или Shorts. several — стримеров несколько: в сообщении имя и хештег стримера."""
+    tag = streamer_tag(streamer) if several else ""
     if seg.kind == SHORT:
-        return render_short(seg, tz, privacy), segment_keyboard(seg)
+        return render_short(seg, tz, privacy, tag), segment_keyboard(seg)
     part = f" (часть {seg.part})" if seg.part else ""
     date = local_time(vod.started_at, tz)
     name = escape(seg.stream_title or vod.title)
@@ -220,6 +279,7 @@ def render_segment(
     lines = [
         f"🎮 <b>{escape(seg.category)}</b>{part} · {fmt_spans(spans)}"
         f" ({fmt_duration(sum(end - start for start, end in spans))})",
+        *([tag] if tag else []),
         stream,
         f"Название: {escape(seg.title)}",
         "",
@@ -229,8 +289,10 @@ def render_segment(
     return "\n".join(lines), segment_keyboard(seg)
 
 
-def render_vod_header(vod: Vod, streamer: Streamer, segments: list[Segment], tz: ZoneInfo) -> str:
-    name = escape(streamer.display_name or streamer.login)
+def render_vod_header(
+    vod: Vod, streamer: Streamer, segments: list[Segment], tz: ZoneInfo, several: bool = False
+) -> str:
+    name = escape(streamer.display_name or streamer.login) + (f" #{streamer.login}" if several else "")
     date = local_time(vod.started_at, tz, "%d.%m.%Y")
     when = f" · {date}" if date else ""
     skipped = sum(seg.status == Status.SKIPPED for seg in segments)

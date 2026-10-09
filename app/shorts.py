@@ -84,7 +84,7 @@ class ShortsScout:
         """Ставит в очередь новые клипы всех стримеров и возвращает, сколько Shorts добавлено (вместе с пропущенными)."""
         app = self.app
         async with app.sessions() as session:
-            streamers = await all_streamers(session, connected=True)
+            streamers = await all_streamers(session, connected=True, watched=True)
             stored = list((await session.scalars(select(Segment).where(Segment.kind == SHORT))).all())
         self._clean_files(stored)
         added = 0
@@ -207,7 +207,7 @@ class ShortsScout:
             )
             session.add(seg)
         log.info("Shorts из клипа %s (%s просмотров): %s", clip.slug, clip.views, reason or "в очереди")
-        text, markup = render_segment(seg, vod, streamer, app.tz, settings.publish_privacy)
+        text, markup = render_segment(seg, vod, streamer, app.tz, settings.publish_privacy, app.several)
         message = await app.notify(text, markup=markup, silent=True)
         if message:
             await update_segment(app, seg.id, tg_message_id=message.message_id)

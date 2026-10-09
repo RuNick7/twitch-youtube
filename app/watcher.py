@@ -38,7 +38,7 @@ class Watcher:
     async def run(self) -> None:
         while True:
             async with self.app.sessions() as session:
-                streamers = await all_streamers(session)
+                streamers = await all_streamers(session, watched=True)
             for streamer in streamers:
                 await self._check(streamer)
             await asyncio.sleep(self.app.settings.watch_interval_sec)
@@ -140,7 +140,7 @@ class TitleTracker:
         if self.client is None:
             self.client = await client_id()
         async with self.app.sessions() as session:
-            streamers = await all_streamers(session)
+            streamers = await all_streamers(session, watched=True)
         states = await live_states(self.app.http, [streamer.login for streamer in streamers], self.client)
         for streamer in streamers:
             await self._track(streamer, states.get(streamer.login))
