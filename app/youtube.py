@@ -189,17 +189,28 @@ class YouTubeClient:
     async def _auth(self, refresh_token: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {await self.access_token(refresh_token)}"}
 
-    async def _api(self, method: str, path: str, refresh_token: str, **kwargs) -> httpx.Response:
-        """Запрос к Data API.
+    async def _request(
+        self, method: str, url: str, refresh_token: str, *, headers: dict[str, str] | None = None, **kwargs
+    ) -> httpx.Response:
+        """Запрос с токеном доступа.
 
         Если токен доступа отозвали раньше срока (401), он запрашивается заново.
         Когда отозван и сам доступ, это становится AuthError.
         """
-        resp = await self._http.request(method, f"{API_URL}/{path}", headers=await self._auth(refresh_token), **kwargs)
+
+        async def send() -> httpx.Response:
+            auth = await self._auth(refresh_token)
+            return await self._http.request(method, url, headers={**(headers or {}), **auth}, **kwargs)
+
+        resp = await send()
         if resp.status_code == 401:
             self.forget(refresh_token)
-            resp = await self._http.request(method, f"{API_URL}/{path}", headers=await self._auth(refresh_token), **kwargs)
+            resp = await send()
         return resp
+
+    async def _api(self, method: str, path: str, refresh_token: str, **kwargs) -> httpx.Response:
+        """Запрос к Data API."""
+        return await self._request(method, f"{API_URL}/{path}", refresh_token, **kwargs)
 
     async def my_channel(self, refresh_token: str) -> tuple[str, str]:
         """ID и название канала, к которому выдан доступ."""
@@ -252,6 +263,7 @@ class YouTubeClient:
         buffer_start = offset
         source = open_stream(offset)
         failures = 0
+        reauthorized = False  # токен доступа уже запрошен заново, а кусок с ним ещё не принят
         try:
             while True:
                 if not buffer_start <= offset <= buffer_start + len(buffer):
@@ -272,7 +284,7 @@ class YouTubeClient:
                     raise YouTubeError("источник длиннее заявленного размера")
                 size = min(chunk_size, len(buffer))
                 started = time.monotonic()
-                problem: Exception
+                problem: Exception | None
                 try:
                     resp = await self._http.put(
                         session_uri,
@@ -293,18 +305,28 @@ class YouTubeClient:
                     if resp.status_code == 308:
                         offset = _received_bytes(resp)
                         failures = 0
+                        reauthorized = False
                         await on_progress(offset * 100 // total)
                         await self._throttle(size, started, limit_mbit)
                         continue
-                    if resp.status_code not in RETRYABLE_STATUS:
+                    if resp.status_code == 401 and not reauthorized:
+                        # Токен доступа отозвали раньше срока: это не сбой загрузки. Следующий запрос
+                        # получит новый токен, а если отозван и сам доступ — AuthError
+                        self.forget(refresh_token)
+                        reauthorized = True
+                        problem = None
+                    elif resp.status_code in RETRYABLE_STATUS:
+                        problem = _error(resp)
+                    else:
                         raise _error(resp)
-                    problem = _error(resp)
 
-                failures += 1
-                if failures > MAX_RETRIES:
-                    raise YouTubeError(f"загрузка прервалась: {problem}")
-                log.warning("Сбой загрузки (%s), попытка %s из %s", problem, failures, MAX_RETRIES)
-                await asyncio.sleep(min(60, 2**failures))
+                if problem is not None:
+                    failures += 1
+                    if failures > MAX_RETRIES:
+                        raise YouTubeError(f"загрузка прервалась: {problem}")
+                    log.warning("Сбой загрузки (%s), попытка %s из %s", problem, failures, MAX_RETRIES)
+                    await asyncio.sleep(min(60, 2**failures))
+                # И после сбоя, и после 401 кусок уходит заново с того байта, который назовёт YouTube
                 try:
                     state = await self._query(refresh_token, session_uri, total)
                 except httpx.TransportError:
@@ -397,15 +419,13 @@ class YouTubeClient:
                 return result
 
     async def _create_session(self, refresh_token: str, total: int, metadata: dict) -> str:
-        resp = await self._http.post(
+        resp = await self._request(
+            "POST",
             UPLOAD_URL,
+            refresh_token,
             params={"uploadType": "resumable", "part": ",".join(metadata)},
             json=metadata,
-            headers={
-                **await self._auth(refresh_token),
-                "X-Upload-Content-Length": str(total),
-                "X-Upload-Content-Type": "video/*",
-            },
+            headers={"X-Upload-Content-Length": str(total), "X-Upload-Content-Type": "video/*"},
         )
         if resp.status_code != 200 or "Location" not in resp.headers:
             raise _error(resp)
@@ -413,10 +433,8 @@ class YouTubeClient:
 
     async def _query(self, refresh_token: str, session_uri: str, total: int) -> int | str | None:
         """Сколько байт принято, ID готового видео или None, если сессия истекла."""
-        resp = await self._http.put(
-            session_uri,
-            content=b"",
-            headers={**await self._auth(refresh_token), "Content-Range": f"bytes */{total}"},
+        resp = await self._request(
+            "PUT", session_uri, refresh_token, content=b"", headers={"Content-Range": f"bytes */{total}"}
         )
         if resp.status_code in (200, 201):
             return resp.json()["id"]
