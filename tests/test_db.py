@@ -4,12 +4,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 try:
+    # Движку нужны aiosqlite и greenlet, но импорт app.db проходит и без них: тесты упали бы при подключении
+    import aiosqlite  # noqa: F401
+    import greenlet  # noqa: F401
     from sqlalchemy import select
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from app.db import KV, Streamer, adopt_legacy_state, all_streamers, as_utc, get_streamer, init_db, make_engine
 except ImportError:  # без зависимостей из requirements.txt: эти тесты идут в тестовом образе
-    raise unittest.SkipTest("нужны SQLAlchemy и aiosqlite")
+    raise unittest.SkipTest("нужны SQLAlchemy[asyncio] и aiosqlite")
 
 # Схема базы, пока стример был один: его состояние лежало в общих ключах KV
 OLD_SCHEMA = (

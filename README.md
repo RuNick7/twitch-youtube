@@ -204,13 +204,13 @@ docker compose up -d --build
 
 ## Тесты
 
-Юнит-тесты не требуют зависимостей, кроме тестов базы (`tests/test_db.py`): без SQLAlchemy они пропускаются.
+Юнит-тесты не требуют зависимостей, кроме двух модулей: тестам базы (`tests/test_db.py`) нужны `SQLAlchemy[asyncio]` и `aiosqlite`, тестам настроек стримеров и опроса Twitch (`tests/test_streamers.py`) — `pydantic-settings` и `httpx`. Если чего-то из этого нет, модуль пропускается целиком.
 
 ```bash
 python3 -m unittest discover -s tests -t .
 ```
 
-Все юнит-тесты вместе с тестами базы — в тестовом образе:
+Все юнит-тесты без пропусков — в тестовом образе:
 
 ```bash
 docker build --target test -t twitch-youtube-test . && docker run --rm -v "$PWD/app:/srv/app:ro" -v "$PWD/tests:/srv/tests:ro" twitch-youtube-test python -m unittest discover -s tests -t .
