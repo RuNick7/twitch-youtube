@@ -18,6 +18,7 @@ from .db import (
     TitleChange,
     Vod,
     as_utc,
+    channel_mates,
     dump_spans,
     dump_warnings,
     find_streamer,
@@ -128,7 +129,7 @@ async def ingest_vod(app: App, info: VodInfo, login: str | None = None) -> int:
             planned,
             [reason is None for reason in reasons],
             settings.unnumbered_categories,
-            await upload_counts(session, streamer.id),
+            await upload_counts(session, streamer),
         )
         vod = Vod(
             id=info.id,
@@ -175,12 +176,16 @@ async def ingest_vod(app: App, info: VodInfo, login: str | None = None) -> int:
     return len(segments)
 
 
-async def upload_counts(session, streamer_id: int) -> dict[str, int]:
-    """Сколько роликов каждой категории (ключ — category_key) бот уже загружал или поставил в очередь."""
+async def upload_counts(session, streamer: Streamer) -> dict[str, int]:
+    """Сколько роликов каждой категории (ключ — category_key) бот уже загружал или поставил в очередь.
+
+    Счёт общий для всех каналов Twitch одного стримера (db.channel_mates): на YouTube-канале они идут одним рядом.
+    """
+    mates = [mate.id for mate in await channel_mates(session, streamer)]
     rows = await session.execute(
         select(Segment.category, func.count())
         .join(Vod, Vod.id == Segment.vod_id)
-        .where(Vod.streamer_id == streamer_id, Segment.status != Status.SKIPPED, Segment.kind.is_(None))
+        .where(Vod.streamer_id.in_(mates), Segment.status != Status.SKIPPED, Segment.kind.is_(None))
         .group_by(Segment.category)
     )
     counts: dict[str, int] = {}
@@ -204,7 +209,7 @@ async def queue_skipped(app: App, segment_id: int, review: bool) -> bool:
         key = category_key(seg.category)
         numbered = key not in {category_key(category) for category in app.config(streamer).unnumbered_categories}
         if seg.kind is None and numbered:  # у Shorts номера части нет
-            seg.part = (await upload_counts(session, streamer.id)).get(key, 0) + 1
+            seg.part = (await upload_counts(session, streamer)).get(key, 0) + 1
             seg.title = build_title(seg.category, seg.stream_title or vod.title, streamer.public_name, seg.part)
         seg.status = Status.QUEUED
         seg.queued_at = utcnow()
@@ -268,11 +273,13 @@ async def forget_youtube(app: App, streamer_id: int, reason: str) -> None:
     роликов, ID плейлистов, а заодно и согласие с политикой.
 
     Правила YouTube API требуют этого после отзыва доступа. Сами ролики и плейлисты остаются на YouTube,
-    а сегменты, которые ещё не загружены, ждут в очереди нового подключения.
+    а сегменты, которые ещё не загружены, ждут в очереди нового подключения. Если тот же YouTube-канал
+    остаётся подключённым через другой канал Twitch этого стримера, ID плейлистов переходят к нему.
     """
     vods = select(Vod.id).where(Vod.streamer_id == streamer_id)
     async with app.sessions() as session, session.begin():
         streamer = await session.get(Streamer, streamer_id)
+        await _hand_over_playlists(session, streamer)
         if streamer.youtube_token:
             app.youtube.forget(app.vault.decrypt(streamer.youtube_token))
         streamer.youtube_token = streamer.youtube_channel_id = streamer.youtube_channel_title = None
@@ -302,6 +309,20 @@ async def forget_youtube(app: App, streamer_id: int, reason: str) -> None:
         )
     for segment_id in with_buttons:
         await app.refresh_segment(segment_id)
+
+
+async def _hand_over_playlists(session, streamer: Streamer) -> None:
+    """Плейлисты, которые завёл отключаемый канал Twitch, переходят к другому каналу того же стримера: YouTube-канал
+    остаётся подключённым через него, и без этой записи бот создал бы там второй плейлист с тем же названием."""
+    heir = next((mate for mate in await channel_mates(session, streamer) if mate.id != streamer.id), None)
+    if heir is None:
+        return
+    taken = set((await session.scalars(select(Playlist.category).where(Playlist.streamer_id == heir.id))).all())
+    await session.execute(
+        update(Playlist)
+        .where(Playlist.streamer_id == streamer.id, Playlist.category.not_in(taken))
+        .values(streamer_id=heir.id)
+    )
 
 
 async def status_counts(app: App, kind: str | None = None, streamer_id: int | None = None) -> dict[str, int]:

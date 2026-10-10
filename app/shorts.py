@@ -4,13 +4,15 @@
 shorts_min_views просмотров становится вертикальным роликом 1080×1920 (клип по центру
 на размытом фоне) и дальше идёт тем же путём, что сегменты: приватная загрузка,
 проверки YouTube, публикация, плейлист «Shorts | <стример>». Не больше shorts_per_day
-Shorts за сутки; из одного момента стрима выходит один Shorts.
+Shorts за сутки; из одного момента стрима выходит один Shorts. У каналов Twitch одного
+стримера (db.channel_mates) суточный лимит общий: берутся самые просматриваемые клипы со всех.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import AsyncGenerator
@@ -28,6 +30,7 @@ from .db import (
     Streamer,
     TitleChange,
     all_streamers,
+    channel_mates,
     clips_vod_id,
     dump_warnings,
     get_clips_vod,
@@ -59,6 +62,17 @@ def shorts_dir(app: App) -> Path:
     return path
 
 
+@dataclass
+class Candidate:
+    """Клип, из которого можно сделать Shorts, и всё, что для этого выяснено."""
+
+    streamer: Streamer
+    settings: Settings
+    clip: Clip
+    stream_title: str | None
+    reason: str | None  # почему клип не загружается; None — годится
+
+
 class ShortsScout:
     """Следит за клипами каналов всех стримеров и ставит в очередь новые Shorts по их настройкам."""
 
@@ -86,49 +100,73 @@ class ShortsScout:
         async with app.sessions() as session:
             streamers = await all_streamers(session, connected=True, watched=True)
             stored = list((await session.scalars(select(Segment).where(Segment.kind == SHORT))).all())
+            # Каналы Twitch одного стримера идут вместе: лимит Shorts у них общий
+            teams: dict[int, tuple[list[Streamer], list[str]]] = {}
+            for streamer in streamers:
+                mates = await channel_mates(session, streamer)
+                members, _ = teams.setdefault(mates[0].id, ([], [clips_vod_id(mate.login) for mate in mates]))
+                members.append(streamer)
         self._clean_files(stored)
         added = 0
-        for streamer in streamers:
-            settings = app.config(streamer)
-            # Пока владелец канала не принял политику, где описаны Shorts, бот их не делает
-            if not settings.shorts or accepted_version(streamer) < SHORTS_SINCE:
-                continue
-            try:
-                added += await self._scan(streamer, settings)
-            except Exception:
-                self.client = None  # вдруг Twitch сменил ID клиента: возьмём свежий у yt-dlp
-                log.exception("Не удалось проверить клипы канала %s", streamer.login)
+        for members, clips_vods in teams.values():
+            candidates: list[Candidate] = []
+            for streamer in members:
+                settings = app.config(streamer)
+                # Пока владелец канала не принял политику, где описаны Shorts, бот их не делает
+                if not settings.shorts or accepted_version(streamer) < SHORTS_SINCE:
+                    continue
+                try:
+                    candidates += await self._candidates(streamer, settings)
+                except Exception:
+                    self.client = None  # вдруг Twitch сменил ID клиента: возьмём свежий у yt-dlp
+                    log.exception("Не удалось проверить клипы канала %s", streamer.login)
+            added += await self._take(candidates, clips_vods)
         if added:
             app.wake.set()
         return added
 
-    async def _scan(self, streamer: Streamer, settings: Settings) -> int:
+    async def _candidates(self, streamer: Streamer, settings: Settings) -> list[Candidate]:
+        """Новые клипы канала от shorts_min_views просмотров, самые просматриваемые первыми."""
         app = self.app
-        clips_vod = clips_vod_id(streamer.login)
         async with app.sessions() as session:
-            stored = list((await session.scalars(select(Segment).where(Segment.vod_id == clips_vod))).all())
-            recent = await session.scalar(
-                select(func.count())
-                .select_from(Segment)
-                .where(
-                    Segment.vod_id == clips_vod,
-                    Segment.status != Status.SKIPPED,
-                    Segment.queued_at >= utcnow() - timedelta(days=1),
-                )
+            stored = list(
+                (await session.scalars(select(Segment).where(Segment.vod_id == clips_vod_id(streamer.login)))).all()
             )
         if self.client is None:
             self.client = await client_id()
         clips = [clip for clip in map(parse_clip, await popular_clips(app.http, streamer.login, self.client)) if clip]
-        room = settings.shorts_per_day - (recent or 0)
-        added = 0
+        candidates = []
         for clip in choose(clips, settings.shorts_min_views, [_stored_clip(row) for row in stored]):
             stream_title, covering = await self._context(streamer, clip)
             reason = self._skip_reason(settings, clip, stream_title, covering)
-            if reason is None:
-                if room <= 0:
-                    continue  # лимит на сутки: клип дождётся следующей проверки
-                room -= 1
-            await self._add(streamer, settings, clip, stream_title, reason)
+            candidates.append(Candidate(streamer, settings, clip, stream_title, reason))
+        return candidates
+
+    async def _take(self, candidates: list[Candidate], clips_vods: list[str]) -> int:
+        """Ставит клипы в очередь, пока не выбран суточный лимит; clips_vods — записи клипов всех каналов
+        Twitch этого стримера. Клип сверх лимита дождётся следующей проверки."""
+        if not candidates:
+            return 0
+        async with self.app.sessions() as session:
+            taken = await session.scalar(
+                select(func.count())
+                .select_from(Segment)
+                .where(
+                    Segment.vod_id.in_(clips_vods),
+                    Segment.status != Status.SKIPPED,
+                    Segment.queued_at >= utcnow() - timedelta(days=1),
+                )
+            )
+        taken = taken or 0
+        added = 0
+        for candidate in sorted(candidates, key=lambda item: item.clip.views, reverse=True):
+            if candidate.reason is None:
+                if taken >= candidate.settings.shorts_per_day:
+                    continue
+                taken += 1
+            await self._add(
+                candidate.streamer, candidate.settings, candidate.clip, candidate.stream_title, candidate.reason
+            )
             added += 1
         return added
 

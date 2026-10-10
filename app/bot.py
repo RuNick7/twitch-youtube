@@ -16,7 +16,19 @@ from sqlalchemy import func, select
 from . import consent, limits, streamers
 from .config import describe_settings
 from .context import App
-from .db import SHORT, Playlist, Segment, Status, Streamer, Vod, all_streamers, as_utc, find_streamer, utcnow
+from .db import (
+    SHORT,
+    Playlist,
+    Segment,
+    Status,
+    Streamer,
+    Vod,
+    all_streamers,
+    as_utc,
+    channel_mates,
+    find_streamer,
+    utcnow,
+)
 from .segments import clean_line, is_short_reason, match_streamer, parse_channel, parse_vod_id
 from .service import (
     DISCONNECTED_REASON,
@@ -81,6 +93,7 @@ PUBLISH_PLACES = {"public": "публично", "unlisted": "по ссылке"}
 NAME_MAX_CHARS = 40  # имя стоит в названии каждого ролика, а названию отведено 100 символов
 MESSAGE_ROOM = 3800  # сообщение Telegram вмещает 4096 символов
 RESET_WORDS = ("-", "default", "общее", "общая")  # /set <стример> <настройка> - возвращает общую настройку
+SHARED = "номера частей, плейлисты и лимит Shorts"  # что общее у каналов Twitch одного стримера (db.channel_mates)
 
 STATUS_LABELS = (
     (Status.QUEUED, "в очереди"),
@@ -202,6 +215,8 @@ async def list_streamers(message: Message, app: App) -> None:
         return
     blocks = []
     for row in shown:
+        async with app.sessions() as session:
+            mates = [mate for mate in await channel_mates(session, row) if mate.id != row.id]
         youtube = f"«{escape(row.youtube_channel_title or '')}»" if row.youtube_token else "не подключён"
         permission = (
             f"разрешение стримера отмечено {local_time(row.permitted_at, app.tz, '%d.%m.%Y')}"
@@ -218,6 +233,7 @@ async def list_streamers(message: Message, app: App) -> None:
                 [
                     f"<b>{streamer_tag(row)}</b> — twitch.tv/{escape(row.login)}",
                     f"YouTube: {youtube}",
+                    *([f"Общие {SHARED} с: {', '.join(escape(_name(mate)) for mate in mates)}"] if mates else []),
                     permission[0].upper() + permission[1:],
                     f"Своих настроек: {own} (/set {escape(row.login)})",
                     *state,
@@ -347,10 +363,17 @@ async def rename_streamer(message: Message, command: CommandObject, app: App) ->
         )
         return
     await streamers.rename(app, target.id, name)
-    await message.answer(
+    text = (
         f"✅ {escape(_name(target))}: в названиях новых роликов и плейлистов теперь «{escape(name)}». "
         "Уже нарезанные ролики и созданные плейлисты названий не меняют."
     )
+    async with app.sessions() as session:
+        target = await session.get(Streamer, target.id)
+        mates = [mate for mate in await channel_mates(session, target) if mate.id != target.id]
+    if mates:
+        names = ", ".join(escape(_name(mate)) for mate in mates)
+        text += f"\nИмя и YouTube-канал те же, что у {names}: {SHARED} у них теперь общие."
+    await message.answer(text)
 
 
 def _shown(value: object) -> str:
@@ -522,12 +545,21 @@ async def _finish_youtube(app: App, code: DeviceCode, prompt: Message, streamer_
         streamer.youtube_channel_id = channel_id
         streamer.youtube_channel_title = title
         shared = await _same_channel(session, streamer)
+        mates = {mate.id for mate in await channel_mates(session, streamer)}
     text = f"✅ Подключён канал «{escape(title)}»"
     if app.several:
         text += f" для стримера {escape(_name(streamer))}"
     if shared:
         names = ", ".join(escape(_name(other)) for other in shared)
         text += f"\nЭтот же канал подключён для: {names}. Ролики выходят на одном канале."
+        same = ", ".join(escape(_name(other)) for other in shared if other.id in mates)
+        if same:
+            text += f"\nИмя в названиях то же, что у {same}, — «{escape(streamer.public_name)}»: {SHARED} у них общие."
+        else:
+            text += (
+                f"\nИмена в названиях разные, поэтому {SHARED} у каждого свои. Если это каналы одного стримера, "
+                f"дайте им одно имя: /name {escape(streamer.login)} &lt;имя&gt;"
+            )
     if await is_paused(app, streamer.id):
         text += f"\nОбработка на паузе: {command_for('/resume', streamer, app.several)} — продолжить."
     await prompt.edit_text(text)

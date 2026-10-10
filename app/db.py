@@ -244,6 +244,29 @@ async def all_streamers(session: AsyncSession, connected: bool = False, watched:
     return list((await session.scalars(query)).all())
 
 
+async def channel_mates(session: AsyncSession, streamer: Streamer) -> list[Streamer]:
+    """Каналы Twitch одного стримера: они подключены к одному YouTube-каналу и носят одно имя в названиях
+    роликов. У таких каналов общие номера частей, плейлисты и суточный лимит Shorts.
+
+    Возвращает и самого стримера, в порядке добавления. Убранные командой /remove тоже здесь, пока их
+    канал подключён: их ролики остаются на том же YouTube-канале.
+    """
+    if not (streamer.youtube_token and streamer.youtube_channel_id):
+        return [streamer]
+    rows = await session.scalars(
+        select(Streamer)
+        .where(Streamer.youtube_token.is_not(None), Streamer.youtube_channel_id == streamer.youtube_channel_id)
+        .order_by(Streamer.id)
+    )
+    name = _name_key(streamer.public_name)
+    mates = [row for row in rows.all() if _name_key(row.public_name) == name]
+    return mates if any(row.id == streamer.id for row in mates) else [streamer]
+
+
+def _name_key(name: str) -> str:
+    return " ".join(name.split()).casefold()
+
+
 async def get_streamer(session: AsyncSession, login: str) -> Streamer:
     streamer = await find_streamer(session, login)
     if streamer is None:

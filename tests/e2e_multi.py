@@ -5,8 +5,9 @@
 
 Проверяет управление стримерами из бота: /add с отметкой о разрешении, /name, /set, /remove, /streamers,
 выбор стримера в /youtube, /disconnect, /pause и /resume, имя и хештег стримера в сообщениях, а ещё то,
-что пауза, лимиты YouTube, Shorts и слежение у каждого стримера свои. Отдельным шагом — загрузка,
-когда YouTube отклонил токен доступа раньше срока.
+что пауза, лимиты YouTube, Shorts и слежение у каждого стримера свои. Отдельными шагами — загрузка,
+когда YouTube отклонил токен доступа раньше срока, и два канала Twitch одного стримера на одном
+YouTube-канале: общие номера частей, плейлисты и лимит Shorts.
 
 Запуск описан в README («Тесты»).
 """
@@ -53,10 +54,12 @@ import app.worker as worker_mod  # noqa: E402
 from aiogram import Bot  # noqa: E402
 from aiohttp import web  # noqa: E402
 from cryptography.fernet import Fernet  # noqa: E402
-from sqlalchemy import select, update  # noqa: E402
+from sqlalchemy import func, select, update  # noqa: E402
 from sqlalchemy.ext.asyncio import async_sessionmaker  # noqa: E402
 
-from app.db import KV, SHORT, Segment, Status, Streamer, TitleChange, Vod, as_utc, clips_vod_id, make_engine  # noqa: E402
+from app.db import (  # noqa: E402
+    KV, SHORT, Playlist, Segment, Status, Streamer, TitleChange, Vod, as_utc, clips_vod_id, make_engine,
+)
 from app.tools import ToolError, VodInfo  # noqa: E402
 from app.twitch import LiveState, TwitchError  # noqa: E402
 
@@ -845,7 +848,99 @@ async def main():
     check(waiting.status == Status.QUEUED and waiting.error is None and tg.find("не загружен", since) is None,
           "ролик остался в очереди, а не отмечен как незагруженный", (waiting.status, waiting.error))
 
-    print("\n== 13. Протоколы и итог", flush=True)
+    print("\n== 13. Два канала Twitch одного стримера на одном YouTube-канале", flush=True)
+    twitch.names["beta_two"] = "BetaSecond"
+    twitch.clips = {}  # клипы появятся, когда оба канала будут готовы
+    google.channel_of["5"] = "1"  # после отзыва доступа в шаге 12 Бета снова входит в свой канал
+    await connect("/youtube beta_channel")
+    await ask("/resume beta_channel", "обработка продолжена")
+    await wait_for(lambda: all_in("9000041", done), 60, "ролик Беты, ждавший нового входа")
+    await ask("/set beta_channel shorts_per_day -", "shorts_per_day")
+    await add("/add beta_two Бета Два")
+    google.channel_of["6"] = "1"  # второй канал Беты входит в тот же YouTube-канал
+    text = await connect("/youtube beta_two")
+    check("Этот же канал подключён для: BetaTV" in text and "Имена в названиях разные" in text
+          and "/name beta_two" in text,
+          "тот же YouTube-канал, но другое имя: бот говорит, что счёт у каналов свой, и как сделать его общим", text)
+    twitch.add_vod("9000050", "beta_two", "Второй канал", [(0, 3600, "Portal")])
+    process("9000050")
+    apart = await wait_for(lambda: all_in("9000050", done), 60, "ролик второго канала с другим именем")
+    check(apart[0].title == "Portal | Второй канал | Часть 1 | Бета Два",
+          "пока имена разные, номера частей у каналов свои", apart[0].title)
+
+    _, text = await ask("/name beta_two Бета", "в названиях новых роликов")
+    check("те же, что у BetaTV" in text and "номера частей, плейлисты и лимит Shorts у них теперь общие" in text,
+          "/name с тем же именем объединяет каналы одного стримера", text)
+    _, text = await ask("/streamers", "twitch.tv/beta_two")
+    check("Общие номера частей, плейлисты и лимит Shorts с: BetaSecond" in text
+          and "Общие номера частей, плейлисты и лимит Shorts с: BetaTV" in text,
+          "/streamers показывает, какие каналы считаются вместе", text)
+
+    def dota_lists():
+        return [pid for pid, item in google.playlists.items() if item["title"] == "Dota 2 | Бета"]
+
+    def lists_with(video):
+        return [pid for pid, item in google.playlists.items() if video in item["items"]]
+
+    lists_before = len(dota_lists())
+    twitch.add_vod("9000051", "beta_two", "Второй канал снова", [(0, 1800, "Dota 2"), (1800, 3600, "Just Chatting")])
+    process("9000051")
+    two = await wait_for(lambda: all_in("9000051", done), 60, "ролики второго канала")
+    twitch.add_vod("9000052", "beta_channel", "Основной канал", [(0, 3600, "Dota 2")])
+    process("9000052")
+    one = await wait_for(lambda: all_in("9000052", done), 60, "ролик основного канала")
+    check(two[0].title == "Dota 2 | Второй канал снова | Часть 2 | Бета"
+          and one[0].title == "Dota 2 | Основной канал | Часть 3 | Бета",
+          "номера частей общие: второй канал продолжает счёт первого, первый — счёт второго",
+          (two[0].title, one[0].title))
+    check(google.uploaders.get(two[0].title) == "RT-6" and google.uploaders.get(one[0].title) == "RT-5",
+          "каждый канал Twitch загружает со своим токеном", google.uploaders)
+    await wait_for(lambda: lists_with(one[0].youtube_id) and lists_with(two[0].youtube_id), 30, "ролики в плейлисте")
+    check(lists_with(one[0].youtube_id) == lists_with(two[0].youtube_id) and len(dota_lists()) == lists_before + 1,
+          "плейлист категории общий: ролики обоих каналов в одном, второй плейлист не создан",
+          (lists_with(one[0].youtube_id), lists_with(two[0].youtube_id), dota_lists()))
+
+    # У Беты за сутки уже был один Shorts (b1), лимит — два: на оба канала остаётся одно место
+    twitch.clips = {
+        "beta_channel": [
+            base.clip_node("b2", "BetaClipTwo", "бета удивляется", 800, 15, "Dota 2"),
+            base.clip_node("b3", "BetaClipThree", "бета спорит", 600, 15, "Dota 2"),
+        ],
+        "beta_two": [
+            base.clip_node("c1", "SecondClipOne", "бета на втором канале", 950, 15, "Dota 2"),
+            base.clip_node("c2", "SecondClipTwo", "бета прощается", 700, 15, "Dota 2"),
+        ],
+    }
+    app().shorts_wake.set()
+    await wait_for(lambda: _count(shorts, "beta_two", 1), 30, "Shorts второго канала")
+    await wait_for(lambda: shorts("beta_two", done), 60, "Shorts второго канала опубликован")
+    app().shorts_wake.set()
+    await asyncio.sleep(2)
+    first, second = await shorts("beta_channel"), await shorts("beta_two")
+    check([r.clip_id for r in first] == ["b1"] and [r.clip_id for r in second] == ["c1"],
+          "лимит Shorts общий на два канала: на одно место взят самый просматриваемый клип из обоих",
+          ([r.clip_id for r in first], [r.clip_id for r in second]))
+    check(second[0].title == "бета на втором канале | Бета" and google.uploaders.get(second[0].title) == "RT-6",
+          "Shorts второго канала назван тем же именем и загружен с его токеном", second[0].title)
+
+    confirm, _ = await ask("/disconnect beta_two", "Отключить YouTube-канал")
+    await press(confirm, "🔌")
+    await wait_for(lambda: "отключён" in tg.messages[confirm]["text"], 30, "отключение второго канала")
+    beta, beta_two = await streamer("beta_channel"), await streamer("beta_two")
+    async with db() as s:
+        owners = dict((await s.execute(select(Playlist.streamer_id, func.count()).group_by(Playlist.streamer_id))).all())
+    check("доступ в Google не отозван" in tg.messages[confirm]["text"] and beta_two.youtube_token is None
+          and beta.youtube_token is not None and set(owners) == {beta.id},
+          "второй канал отключён: доступ в Google остаётся, плейлисты переходят к первому каналу", owners)
+    twitch.add_vod("9000053", "beta_channel", "Основной канал один", [(0, 3600, "Dota 2")])
+    process("9000053")
+    last = await wait_for(lambda: all_in("9000053", done), 60, "ролик основного канала после отключения второго")
+    await wait_for(lambda: lists_with(last[0].youtube_id), 30, "ролик в плейлисте")
+    check(lists_with(last[0].youtube_id) == lists_with(one[0].youtube_id) and len(dota_lists()) == lists_before + 1,
+          "после отключения второго канала первый пользуется тем же плейлистом",
+          (lists_with(last[0].youtube_id), dota_lists()))
+
+    print("\n== 14. Протоколы и итог", flush=True)
     check(not tg.problems, "все тексты валидны для Telegram", tg.problems[:5])
     check(not google.violations, "запросы к Google соответствуют протоколу", google.violations[:5])
     check(set(tg.calls) <= base.FakeTelegram.KNOWN, "бот не вызывает неожиданных методов Telegram")
