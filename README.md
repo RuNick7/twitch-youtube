@@ -216,7 +216,9 @@ python3 -m unittest discover -s tests -t .
 docker build --target test -t twitch-youtube-test . && docker run --rm -v "$PWD/app:/srv/app:ro" -v "$PWD/tests:/srv/tests:ro" twitch-youtube-test python -m unittest discover -s tests -t .
 ```
 
-Сквозной тест `tests/e2e_multi.py` проверяет работу с несколькими стримерами: `/add` с отметкой о разрешении, `/name`, `/set`, `/remove`, `/streamers`, выбор стримера в командах, имя и хештег в сообщениях, а ещё то, что пауза, лимиты YouTube, Shorts и слежение у каждого стримера свои. Twitch, видео, Telegram и YouTube в нём поддельные, поэтому интернет не нужен; тест идёт около полутора минут. Без Docker он запускается в любом окружении, где установлены зависимости из `requirements.txt`: `python tests/e2e_multi.py`.
+Без httpx пропускаются и тесты загрузки при отклонённом токене доступа (`tests/test_youtube.py`).
+
+Сквозной тест `tests/e2e_multi.py` проверяет работу с несколькими стримерами: `/add` с отметкой о разрешении, `/name`, `/set`, `/remove`, `/streamers`, выбор стримера в командах, имя и хештег в сообщениях, а ещё то, что пауза, лимиты YouTube, Shorts и слежение у каждого стримера свои. Отдельным шагом — загрузка, когда YouTube отклонил токен доступа раньше срока. Twitch, видео, Telegram и YouTube в нём поддельные, поэтому интернет не нужен; тест идёт около полутора минут. Без Docker он запускается в любом окружении, где установлены зависимости из `requirements.txt`: `python tests/e2e_multi.py`.
 
 ```bash
 docker build --target test -t twitch-youtube-test . && docker run --rm --init -v "$PWD/app:/srv/app:ro" -v "$PWD/tests:/srv/tests:ro" twitch-youtube-test python tests/e2e_multi.py

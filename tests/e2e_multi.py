@@ -5,7 +5,8 @@
 
 Проверяет управление стримерами из бота: /add с отметкой о разрешении, /name, /set, /remove, /streamers,
 выбор стримера в /youtube, /disconnect, /pause и /resume, имя и хештег стримера в сообщениях, а ещё то,
-что пауза, лимиты YouTube, Shorts и слежение у каждого стримера свои.
+что пауза, лимиты YouTube, Shorts и слежение у каждого стримера свои. Отдельным шагом — загрузка,
+когда YouTube отклонил токен доступа раньше срока.
 
 Запуск описан в README («Тесты»).
 """
@@ -162,11 +163,30 @@ class Google(base.FakeGoogle):
         self.uploaders: dict[str, str] = {}  # название ролика -> refresh-токен, с которым он загружен
         self.upload_limited: set[str] = set()  # токены каналов, упёршихся в дневной лимит загрузок
         self.quota_exceeded = False  # кончилась квота всего Google-проекта
+        self.stale: set[str] = set()  # токены, чей токен доступа отклоняется раньше срока, пока бот не возьмёт новый
+        self.expire_after_create: set[str] = set()  # токены: так станет, едва с ними начнётся следующая загрузка
+        self.denied: list[str] = []  # запросы, на которые ответом был 401
 
     def _refused(self, reason):
         return web.json_response(
             {"error": {"code": 403, "message": f"refused: {reason}", "errors": [{"reason": reason}]}}, status=403
         )
+
+    def _auth(self, request):
+        """401 ещё и на токен доступа, отклонённый раньше срока. Все отказы записываются в denied."""
+        denied = super()._auth(request)
+        if denied is None and request.headers.get("Authorization", "").removeprefix("Bearer AT-") in self.stale:
+            error = {"code": 401, "message": "Invalid Credentials", "errors": [{"reason": "authError"}]}
+            denied = web.json_response({"error": error}, status=401)
+        if denied is not None:
+            self.denied.append(f"{request.method} {request.path}")
+        return denied
+
+    async def token(self, request):
+        response = await super().token(request)
+        if response.status == 200:
+            self.stale.discard((await request.post()).get("refresh_token"))  # новый токен доступа действует
+        return response
 
     async def channels(self, request):
         if (denied := self._auth(request)) is not None:
@@ -185,6 +205,9 @@ class Google(base.FakeGoogle):
         response = await super().create(request)
         if response.status == 200:
             self.uploaders[self.sessions[f"s{len(self.sessions)}"]["title"]] = token
+            if token in self.expire_after_create:
+                self.expire_after_create.discard(token)
+                self.stale.add(token)
         return response
 
 
@@ -504,7 +527,7 @@ async def main():
 
     print("\n== 5. Проблема одного канала не останавливает остальные", flush=True)
     await wait_for(lambda: settled("9000001", "9000003"), 30, "наблюдение за роликами Беты закончилось")
-    app().youtube.forget("RT-1")  # как будто токен доступа истёк
+    app().youtube.forget("RT-1")  # как будто токен доступа истёк (когда ещё не истёк — шаг 12)
     google.revoked.add("RT-1")  # а доступ к каналу Беты отозван в Google
     twitch.add_vod("9000004", "beta_channel", "Бета опять", [(0, 3600, "Dota 2")])
     twitch.add_vod("9000005", "alpha_channel", "Альфа снова", [(0, 3600, "Minecraft")])
@@ -787,7 +810,42 @@ async def main():
           and as_utc(rows["alpha_channel"].watch_since) == OLD_SINCE and not legacy,
           "после перезапуска стримеры на месте, перенос настроек не повторяется")
 
-    print("\n== 12. Протоколы и итог", flush=True)
+    print("\n== 12. Токен доступа отклонён раньше срока", flush=True)
+
+    async def quiet(vod_id):
+        """Ролики опубликованы и лежат в плейлистах: сам бот к YouTube за ними больше не пойдёт."""
+        rows = await segs(vod_id)
+        ready = all(r.status in done and r.check_at is None and r.playlist_added_at for r in rows)
+        return rows if rows and ready else None
+
+    await ask("/resume beta_channel", "обработка продолжена")  # пауза осталась с шага 10: новый вход её не снимает
+    google.expire_after_create.add("RT-4")  # Google отклонит токен доступа, едва начнётся загрузка
+    twitch.add_vod("9000040", "beta_channel", "Бета до отзыва", [(0, 600, "Portal 2")])
+    seen, since = len(google.denied), tg.next_message_id
+    process("9000040")
+    uploaded = (await wait_for(lambda: quiet("9000040"), 60, "ролик Беты с новым токеном доступа"))[0]
+    sid, session = next(item for item in google.sessions.items() if item[1]["title"] == uploaded.title)
+    check(google.denied[seen:] == [f"PUT /upload/session/{sid}"] and session["queries"] == 1
+          and not (await streamer("beta_channel")).paused and tg.find("не загружен", since) is None,
+          "токен доступа отклонён посреди загрузки: бот взял новый, сверил смещение с YouTube и догрузил ролик",
+          (google.denied[seen:], session["queries"]))
+
+    google.revoked.add("RT-4")  # доступ отозван в Google, а токен доступа у бота ещё не истёк: forget не нужен
+    twitch.add_vod("9000041", "beta_channel", "Бета после отзыва", [(0, 600, "Portal 2")])
+    seen, since = len(google.denied), tg.next_message_id
+    process("9000041")
+    notice = await wait_for(lambda: tg.find("доступ к YouTube отозван или истёк", since), 30,
+                            "загрузка заметила отзыв доступа по ответу 401")
+    text, waiting = tg.messages[notice]["text"], (await segs("9000041"))[0]
+    check(google.denied[seen:] == ["POST /upload/youtube/v3/videos"],
+          "об отзыве доступа бот узнал из ответа 401 на загрузку", google.denied[seen:])
+    check(text.startswith(f"🔴 {BETA} · Обработка на паузе: доступ к YouTube отозван или истёк")
+          and "/youtube beta_channel, затем /resume beta_channel" in text and (await streamer("beta_channel")).paused,
+          "Бета встала на паузу: бот называет стримера, причину и команды", text)
+    check(waiting.status == Status.QUEUED and waiting.error is None and tg.find("не загружен", since) is None,
+          "ролик остался в очереди, а не отмечен как незагруженный", (waiting.status, waiting.error))
+
+    print("\n== 13. Протоколы и итог", flush=True)
     check(not tg.problems, "все тексты валидны для Telegram", tg.problems[:5])
     check(not google.violations, "запросы к Google соответствуют протоколу", google.violations[:5])
     check(set(tg.calls) <= base.FakeTelegram.KNOWN, "бот не вызывает неожиданных методов Telegram")
