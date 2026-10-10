@@ -2,6 +2,7 @@
 
 У Shorts свой плейлист «Shorts | <стример>». Плейлист создаётся при первом опубликованном
 ролике категории. Если его удалили на YouTube, бот создаёт новый при следующем ролике.
+У каналов Twitch одного стримера (db.channel_mates) плейлисты общие.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from sqlalchemy import delete, select
 
 from .consent import PLAYLISTS_SINCE, accepted_version
 from .context import App
-from .db import SHORT, Playlist, Segment, Status, Streamer, Vod, all_streamers, utcnow
+from .db import SHORT, Playlist, Segment, Status, Streamer, Vod, all_streamers, channel_mates, utcnow
 from .segments import build_playlist_title, category_key
 from .service import update_segment
 from .youtube import LIMIT_REASONS, AuthError, YouTubeError
@@ -57,24 +58,30 @@ async def _sync(app: App, streamer: Streamer) -> None:
                 )
             ).all()
         )
-        playlists = {
-            row.category: row.youtube_id
-            for row in (await session.scalars(select(Playlist).where(Playlist.streamer_id == streamer.id))).all()
-        }
+        mates = await channel_mates(session, streamer)
+        rows = (
+            await session.scalars(
+                select(Playlist).where(Playlist.streamer_id.in_([mate.id for mate in mates])).order_by(Playlist.id)
+            )
+        ).all()
+    # Свой плейлист категории, а если его нет — заведённый другим каналом Twitch того же стримера
+    playlists: dict[str, str] = {}
+    for row in sorted(rows, key=lambda row: row.streamer_id != streamer.id):
+        playlists.setdefault(row.category, row.youtube_id)
     for seg in pending:
         category = SHORTS_PLAYLIST if seg.kind == SHORT else seg.category
         key = category_key(category)
         try:
             if key not in playlists:
-                playlists[key] = await _create(app, streamer, token, category, key)
+                playlists[key] = await _create(app, streamer, mates, token, category, key)
             try:
                 await app.youtube.add_to_playlist(token, playlists[key], seg.youtube_id)
             except YouTubeError as exc:
                 if exc.reason != "playlistNotFound":
                     raise
                 # Плейлист удалили на YouTube: создаём новый
-                await _forget(app, streamer, key)
-                playlists[key] = await _create(app, streamer, token, category, key)
+                await _forget(app, playlists[key])
+                playlists[key] = await _create(app, streamer, mates, token, category, key)
                 await app.youtube.add_to_playlist(token, playlists[key], seg.youtube_id)
         except AuthError:
             return  # отзывом доступа занимается ежедневная сверка
@@ -89,17 +96,18 @@ async def _sync(app: App, streamer: Streamer) -> None:
         await update_segment(app, seg.id, playlist_added_at=utcnow())
 
 
-async def _create(app: App, streamer: Streamer, token: str, category: str, key: str) -> str:
+async def _create(app: App, streamer: Streamer, mates: list[Streamer], token: str, category: str, key: str) -> str:
     settings = app.config(streamer)
     name = streamer.public_name
     if category == SHORTS_PLAYLIST:
         what = f"Shorts из клипов стримов {name}"
     else:
         what = f"Все ролики категории «{category}» со стримов {name}"
+    channels = ", ".join(f"https://www.twitch.tv/{mate.login}" for mate in mates)
     playlist_id = await app.youtube.create_playlist(
         token,
         build_playlist_title(category, name),
-        f"{what}. Twitch: https://www.twitch.tv/{streamer.login}",
+        f"{what}. Twitch: {channels}",
         settings.publish_privacy,
     )
     async with app.sessions() as session, session.begin():
@@ -112,9 +120,9 @@ async def _create(app: App, streamer: Streamer, token: str, category: str, key: 
     return playlist_id
 
 
-async def _forget(app: App, streamer: Streamer, key: str) -> None:
+async def _forget(app: App, playlist_id: str) -> None:
     async with app.sessions() as session, session.begin():
-        await session.execute(delete(Playlist).where(Playlist.streamer_id == streamer.id, Playlist.category == key))
+        await session.execute(delete(Playlist).where(Playlist.youtube_id == playlist_id))
 
 
 async def verify_playlists(app: App, streamer: Streamer, token: str) -> None:
@@ -126,4 +134,4 @@ async def verify_playlists(app: App, streamer: Streamer, token: str) -> None:
     existing = await app.youtube.my_playlists(token)
     for row in rows:
         if row.youtube_id not in existing:
-            await _forget(app, streamer, row.category)
+            await _forget(app, row.youtube_id)
