@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import AsyncGenerator, Awaitable, Callable
 
 import httpx
@@ -32,6 +33,14 @@ SessionCallback = Callable[[str], Awaitable[None]]
 StreamFactory = Callable[[int], AsyncGenerator[bytes, None]]
 
 
+@dataclass(frozen=True)
+class ChannelPlaylist:
+    """Плейлист канала, каким его отдаёт YouTube."""
+
+    title: str
+    created_at: datetime | None
+
+
 class YouTubeError(RuntimeError):
     def __init__(self, message: str, reason: str | None = None, status: int | None = None):
         super().__init__(message)
@@ -50,6 +59,15 @@ class DeviceCode:
     verification_url: str
     expires_in: int
     interval: int
+
+
+def _parse_time(value: str | None) -> datetime | None:
+    """Время из ответа YouTube («2026-10-01T12:00:00Z»); None — его нет или оно не разобралось."""
+    try:
+        parsed = datetime.fromisoformat((value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def _error(resp: httpx.Response) -> YouTubeError:
@@ -403,17 +421,40 @@ class YouTubeClient:
             raise _error(resp)
         return resp.json()["id"]
 
-    async def my_playlists(self, refresh_token: str) -> set[str]:
-        """ID всех плейлистов канала. 1 единица квоты на 50 плейлистов."""
+    async def playlist_videos(self, refresh_token: str, playlist_id: str) -> set[str]:
+        """ID роликов, которые уже лежат в плейлисте. 1 единица квоты на 50 роликов."""
         result: set[str] = set()
         page: str | None = None
         while True:
-            params = {"part": "id", "mine": "true", "maxResults": "50", **({"pageToken": page} if page else {})}
+            params = {
+                "part": "contentDetails",
+                "playlistId": playlist_id,
+                "maxResults": "50",
+                **({"pageToken": page} if page else {}),
+            }
+            resp = await self._api("GET", "playlistItems", refresh_token, params=params)
+            if resp.status_code != 200:
+                raise _error(resp)
+            data = resp.json()
+            result.update((item.get("contentDetails") or {}).get("videoId") for item in data.get("items") or [])
+            page = data.get("nextPageToken")
+            if not page:
+                result.discard(None)
+                return result
+
+    async def my_playlists(self, refresh_token: str) -> dict[str, ChannelPlaylist]:
+        """Все плейлисты канала: ID → название и время создания. 1 единица квоты на 50 плейлистов."""
+        result: dict[str, ChannelPlaylist] = {}
+        page: str | None = None
+        while True:
+            params = {"part": "snippet", "mine": "true", "maxResults": "50", **({"pageToken": page} if page else {})}
             resp = await self._api("GET", "playlists", refresh_token, params=params)
             if resp.status_code != 200:
                 raise _error(resp)
             data = resp.json()
-            result.update(item["id"] for item in data.get("items") or [])
+            for item in data.get("items") or []:
+                snippet = item.get("snippet") or {}
+                result[item["id"]] = ChannelPlaylist(snippet.get("title") or "", _parse_time(snippet.get("publishedAt")))
             page = data.get("nextPageToken")
             if not page:
                 return result

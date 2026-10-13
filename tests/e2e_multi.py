@@ -191,11 +191,14 @@ class Google(base.FakeGoogle):
             self.stale.discard((await request.post()).get("refresh_token"))  # новый токен доступа действует
         return response
 
+    def channel_of_request(self, request):
+        number = request.headers["Authorization"].removeprefix("Bearer AT-RT-")
+        return self.channel_of.get(number, number)
+
     async def channels(self, request):
         if (denied := self._auth(request)) is not None:
             return denied
-        number = request.headers["Authorization"].removeprefix("Bearer AT-RT-")
-        channel = self.channel_of.get(number, number)
+        channel = self.channel_of_request(request)
         title = self.titles.get(channel, f"Канал {channel}")
         return web.json_response({"items": [{"id": f"UC{channel}", "snippet": {"title": title}}]})
 
@@ -882,7 +885,9 @@ async def main():
     def lists_with(video):
         return [pid for pid, item in google.playlists.items() if video in item["items"]]
 
-    lists_before = len(dota_lists())
+    # «Dota 2 | Бета» на канале остался с шага 5: записи о нём удалены вместе с данными канала в шаге 10
+    (dota,) = dota_lists()
+    since = tg.next_message_id
     twitch.add_vod("9000051", "beta_two", "Второй канал снова", [(0, 1800, "Dota 2"), (1800, 3600, "Just Chatting")])
     process("9000051")
     two = await wait_for(lambda: all_in("9000051", done), 60, "ролики второго канала")
@@ -896,9 +901,14 @@ async def main():
     check(google.uploaders.get(two[0].title) == "RT-6" and google.uploaders.get(one[0].title) == "RT-5",
           "каждый канал Twitch загружает со своим токеном", google.uploaders)
     await wait_for(lambda: lists_with(one[0].youtube_id) and lists_with(two[0].youtube_id), 30, "ролики в плейлисте")
-    check(lists_with(one[0].youtube_id) == lists_with(two[0].youtube_id) and len(dota_lists()) == lists_before + 1,
-          "плейлист категории общий: ролики обоих каналов в одном, второй плейлист не создан",
-          (lists_with(one[0].youtube_id), lists_with(two[0].youtube_id), dota_lists()))
+    found = tg.find("Плейлист «Dota 2 | Бета» уже есть на канале", since)
+    check(found is not None and dota in tg.messages[found]["text"] and dota_lists() == [dota]
+          and tg.find("Создан плейлист «Dota 2 | Бета»", since) is None,
+          "после нового подключения бот берёт прежний плейлист канала, а не создаёт второй с тем же названием",
+          dota_lists())
+    check(lists_with(one[0].youtube_id) == lists_with(two[0].youtube_id) == [dota],
+          "плейлист категории общий: ролики обоих каналов Twitch в одном",
+          (lists_with(one[0].youtube_id), lists_with(two[0].youtube_id)))
 
     # У Беты за сутки уже был один Shorts (b1), лимит — два: на оба канала остаётся одно место
     twitch.clips = {
@@ -930,15 +940,38 @@ async def main():
     async with db() as s:
         owners = dict((await s.execute(select(Playlist.streamer_id, func.count()).group_by(Playlist.streamer_id))).all())
     check("доступ в Google не отозван" in tg.messages[confirm]["text"] and beta_two.youtube_token is None
-          and beta.youtube_token is not None and set(owners) == {beta.id},
-          "второй канал отключён: доступ в Google остаётся, плейлисты переходят к первому каналу", owners)
+          and beta.youtube_token is not None and beta_two.id not in owners,
+          "второй канал отключён: доступ в Google остаётся, его записи о плейлистах удалены", owners)
     twitch.add_vod("9000053", "beta_channel", "Основной канал один", [(0, 3600, "Dota 2")])
     process("9000053")
     last = await wait_for(lambda: all_in("9000053", done), 60, "ролик основного канала после отключения второго")
     await wait_for(lambda: lists_with(last[0].youtube_id), 30, "ролик в плейлисте")
-    check(lists_with(last[0].youtube_id) == lists_with(one[0].youtube_id) and len(dota_lists()) == lists_before + 1,
+    check(lists_with(last[0].youtube_id) == [dota] and dota_lists() == [dota],
           "после отключения второго канала первый пользуется тем же плейлистом",
           (lists_with(last[0].youtube_id), dota_lists()))
+
+    # Канал, где дубль уже появился (так было до этого исправления): бот ведёт более новый плейлист
+    # с тем же названием и успел положить в него последний ролик, а прежний плейлист лежит рядом
+    twin = "PLtwin"
+    google.playlists[twin] = {"title": "Dota 2 | Бета", "privacy": "public", "items": [last[0].youtube_id],
+                              "channel": "1", "created": "2026-10-02T00:00:00Z"}
+    google.playlists[dota]["items"].remove(last[0].youtube_id)
+    async with db() as s, s.begin():
+        await s.execute(update(Playlist).where(Playlist.youtube_id == dota).values(youtube_id=twin))
+        await s.execute(update(Streamer).where(Streamer.login == "beta_channel").values(youtube_checked_at=None))
+    since = tg.next_message_id
+    app().sync_wake.set()  # пора ежедневной сверки
+    notice = await wait_for(lambda: tg.find("На канале два плейлиста «Dota 2 | Бета»", since), 30, "дубль замечен")
+    await wait_for(lambda: last[0].youtube_id in google.playlists[dota]["items"], 30, "ролик из дубля в прежнем плейлисте")
+    async with db() as s:
+        stored = list((await s.scalars(select(Playlist.youtube_id).where(Playlist.category == "dota 2"))).all())
+    text = tg.messages[notice]["text"]
+    check(stored == [dota] and f"list={dota}" in text and f"list={twin}" in text and tg.messages[notice]["silent"],
+          "сверка заметила дубль: бот вернулся к старому плейлисту и назвал дубль, который можно удалить", (stored, text))
+    check(google.playlists[dota]["items"].count(last[0].youtube_id) == 1
+          and google.playlists[dota]["items"].count(one[0].youtube_id) == 1 and twin in google.playlists,
+          "ролик из дубля переложен в старый плейлист, уже лежавшие там не добавлены второй раз, дубль не тронут",
+          google.playlists[dota]["items"])
 
     print("\n== 14. Протоколы и итог", flush=True)
     check(not tg.problems, "все тексты валидны для Telegram", tg.problems[:5])
