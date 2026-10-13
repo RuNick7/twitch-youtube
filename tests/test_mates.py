@@ -1,15 +1,14 @@
-"""Два канала Twitch одного стримера на одном YouTube-канале: общие номера частей и плейлисты."""
+"""Два канала Twitch одного стримера на одном YouTube-канале: кто считается вместе и общие номера частей."""
 
 import tempfile
 import unittest
 from pathlib import Path
 
 try:
-    from sqlalchemy import select
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
-    from app.db import Playlist, Segment, Status, Streamer, Vod, channel_mates, init_db, make_engine, utcnow
-    from app.service import _hand_over_playlists, upload_counts
+    from app.db import Segment, Status, Streamer, Vod, channel_mates, init_db, make_engine, utcnow
+    from app.service import upload_counts
 except ImportError:  # без зависимостей из requirements.txt: эти тесты идут в тестовом образе
     raise unittest.SkipTest("нужны зависимости из requirements.txt")
 
@@ -102,41 +101,6 @@ class SharedNumberingTest(MatesCase):
             self.assertEqual(await upload_counts(session, main), {"dota 2": 3, "minecraft": 1})
             self.assertEqual(await upload_counts(session, second), {"dota 2": 3, "minecraft": 1})
             self.assertEqual(await upload_counts(session, friend), {"dota 2": 1})
-
-
-class PlaylistHandoverTest(MatesCase):
-    async def playlists(self):
-        async with self.sessions() as session:
-            rows = (await session.scalars(select(Playlist).order_by(Playlist.id))).all()
-            owners = {row.id: row.login for row in (await session.scalars(select(Streamer))).all()}
-        return [(owners[row.streamer_id], row.category, row.youtube_id) for row in rows]
-
-    async def add_playlists(self, streamer, **playlists):
-        async with self.sessions() as session, session.begin():
-            for category, youtube_id in playlists.items():
-                session.add(Playlist(streamer_id=streamer.id, category=category, youtube_id=youtube_id))
-
-    async def hand_over(self, streamer):
-        async with self.sessions() as session, session.begin():
-            await _hand_over_playlists(session, await session.get(Streamer, streamer.id))
-
-    async def test_playlists_go_to_the_other_channel_of_the_streamer(self):
-        main = await self.add("main", "Заквиель")
-        second = await self.add("second", "Заквиель")
-        await self.add_playlists(main, dota="PL1", minecraft="PL2")
-        await self.add_playlists(second, minecraft="PL3")
-        await self.hand_over(main)
-        # Minecraft у второго канала уже свой: лишняя запись останется у отключаемого и будет удалена вместе с ним
-        self.assertEqual(
-            await self.playlists(), [("second", "dota", "PL1"), ("main", "minecraft", "PL2"), ("second", "minecraft", "PL3")]
-        )
-
-    async def test_nothing_changes_without_mates(self):
-        main = await self.add("main", "Заквиель")
-        await self.add("friend", "Друг")
-        await self.add_playlists(main, dota="PL1")
-        await self.hand_over(main)
-        self.assertEqual(await self.playlists(), [("main", "dota", "PL1")])
 
 
 if __name__ == "__main__":

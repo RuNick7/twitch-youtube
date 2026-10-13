@@ -360,6 +360,7 @@ class FakeGoogle:
         app.router.add_get("/youtube/v3/playlists", self.list_playlists)
         app.router.add_post("/youtube/v3/playlists", self.create_playlist)
         app.router.add_post("/youtube/v3/playlistItems", self.add_playlist_item)
+        app.router.add_get("/youtube/v3/playlistItems", self.list_playlist_items)
         app.router.add_post("/upload/youtube/v3/videos", self.create)
         app.router.add_put("/upload/session/{sid}", self.put)
         return app
@@ -525,9 +526,19 @@ class FakeGoogle:
     async def list_playlists(self, request):
         if (denied := self._auth(request)) is not None:
             return denied
-        if request.query.get("mine") != "true":
+        if request.query.get("mine") != "true" or request.query.get("part") != "snippet":
             self.violations.append(f"playlists.list {dict(request.query)}")
-        return web.json_response({"items": [{"id": pid} for pid in self.playlists]})
+        channel = self.channel_of_request(request)
+        items = [
+            {"id": pid, "snippet": {"title": item["title"], "publishedAt": item["created"]}}
+            for pid, item in self.playlists.items()
+            if item["channel"] == channel
+        ]
+        return web.json_response({"items": items})
+
+    def channel_of_request(self, request):
+        """Канал, от имени которого пришёл запрос. Здесь канал один; тест с несколькими каналами это переопределяет."""
+        return ""
 
     async def create_playlist(self, request):
         if (denied := self._auth(request)) is not None:
@@ -538,7 +549,14 @@ class FakeGoogle:
             self.violations.append(f"playlists.insert {dict(request.query)} {body}")
         self.playlist_seq += 1
         pid = f"PL{self.playlist_seq}"
-        self.playlists[pid] = {"title": snippet.get("title"), "privacy": status.get("privacyStatus"), "items": []}
+        self.playlists[pid] = {
+            "title": snippet.get("title"),
+            "privacy": status.get("privacyStatus"),
+            "items": [],
+            "channel": self.channel_of_request(request),
+            # Как у YouTube: время с точностью до секунды; порядок создания внутри секунды хранит номер
+            "created": f"2026-10-01T00:{self.playlist_seq // 60:02d}:{self.playlist_seq % 60:02d}Z",
+        }
         return web.json_response({"id": pid})
 
     async def add_playlist_item(self, request):
@@ -557,6 +575,16 @@ class FakeGoogle:
             self.violations.append(f"ролик {video} дважды добавлен в плейлист")
         playlist["items"].append(video)
         return web.json_response({"id": f"PLI-{video}"})
+
+    async def list_playlist_items(self, request):
+        if (denied := self._auth(request)) is not None:
+            return denied
+        playlist = self.playlists.get(request.query.get("playlistId"))
+        if request.query.get("part") != "contentDetails" or playlist is None:
+            self.violations.append(f"playlistItems.list {dict(request.query)}")
+            return web.json_response({"error": {"code": 404, "message": "Playlist not found",
+                                                "errors": [{"reason": "playlistNotFound"}]}}, status=404)
+        return web.json_response({"items": [{"contentDetails": {"videoId": video}} for video in playlist["items"]]})
 
     def playlist(self, prefix):
         return next(((pid, p) for pid, p in self.playlists.items() if p["title"].startswith(prefix)), (None, None))

@@ -137,7 +137,7 @@ def render_consent(settings: Settings, streamer_name: str, changes: list[str] | 
         header = "<b>Подключение YouTube-канала</b>\n\n"
     playlists = (
         f"• создавать {PLAYLIST_PRIVACY[settings.publish_privacy]} плейлисты по категориям и добавлять в них "
-        "опубликованные ролики;\n"
+        "опубликованные ролики; если плейлист с таким названием на канале уже есть, ролики идут в него;\n"
         if settings.playlists
         else ""
     )
@@ -160,7 +160,7 @@ def render_consent(settings: Settings, streamer_name: str, changes: list[str] | 
         f"{playlists}"
         f"{shorts}"
         "• проверять состояние загруженных им роликов и созданных плейлистов.\n\n"
-        "Другие ролики и плейлисты, комментарии и статистику канала AutoVOD не трогает. Он хранит "
+        "Другие ролики, плейлисты с другими названиями, комментарии и статистику канала AutoVOD не трогает. Он хранит "
         "зашифрованный токен доступа, ID и название канала, ID и состояние своих роликов, ID своих плейлистов "
         "и раз в сутки сверяет их с YouTube. Отключить канал и удалить эти данные — /disconnect.\n\n"
         f'Нажимая «Принимаю», вы соглашаетесь с <a href="{escape(settings.privacy_url)}">политикой '

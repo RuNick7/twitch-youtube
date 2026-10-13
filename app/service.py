@@ -273,13 +273,12 @@ async def forget_youtube(app: App, streamer_id: int, reason: str) -> None:
     роликов, ID плейлистов, а заодно и согласие с политикой.
 
     Правила YouTube API требуют этого после отзыва доступа. Сами ролики и плейлисты остаются на YouTube,
-    а сегменты, которые ещё не загружены, ждут в очереди нового подключения. Если тот же YouTube-канал
-    остаётся подключённым через другой канал Twitch этого стримера, ID плейлистов переходят к нему.
+    а сегменты, которые ещё не загружены, ждут в очереди нового подключения. После нового подключения
+    бот находит прежние плейлисты на канале по названию (playlists.py), а не создаёт вторые.
     """
     vods = select(Vod.id).where(Vod.streamer_id == streamer_id)
     async with app.sessions() as session, session.begin():
         streamer = await session.get(Streamer, streamer_id)
-        await _hand_over_playlists(session, streamer)
         if streamer.youtube_token:
             app.youtube.forget(app.vault.decrypt(streamer.youtube_token))
         streamer.youtube_token = streamer.youtube_channel_id = streamer.youtube_channel_title = None
@@ -309,20 +308,6 @@ async def forget_youtube(app: App, streamer_id: int, reason: str) -> None:
         )
     for segment_id in with_buttons:
         await app.refresh_segment(segment_id)
-
-
-async def _hand_over_playlists(session, streamer: Streamer) -> None:
-    """Плейлисты, которые завёл отключаемый канал Twitch, переходят к другому каналу того же стримера: YouTube-канал
-    остаётся подключённым через него, и без этой записи бот создал бы там второй плейлист с тем же названием."""
-    heir = next((mate for mate in await channel_mates(session, streamer) if mate.id != streamer.id), None)
-    if heir is None:
-        return
-    taken = set((await session.scalars(select(Playlist.category).where(Playlist.streamer_id == heir.id))).all())
-    await session.execute(
-        update(Playlist)
-        .where(Playlist.streamer_id == streamer.id, Playlist.category.not_in(taken))
-        .values(streamer_id=heir.id)
-    )
 
 
 async def status_counts(app: App, kind: str | None = None, streamer_id: int | None = None) -> dict[str, int]:
