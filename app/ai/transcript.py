@@ -110,7 +110,7 @@ def windows(phrases: Sequence[Phrase], minutes: int = 60, overlap_minutes: int =
         return []
     span, step, end = minutes * 60, (minutes - overlap_minutes) * 60, phrases[-1].end
     result: list[list[Phrase]] = []
-    start = 0.0
+    start = phrases[0].start  # окна считаются от начала самого текста, а не записи: сегмент может идти со второго часа
     while True:
         part = [phrase for phrase in phrases if start <= phrase.start < start + span]
         if part:

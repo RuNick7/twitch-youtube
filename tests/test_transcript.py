@@ -90,6 +90,11 @@ class RenderAndWindowsTest(unittest.TestCase):
         self.assertEqual(len(transcript.windows(phrases)), 1)
         self.assertEqual(transcript.windows([]), [])
 
+    def test_windows_start_at_the_first_phrase_not_at_zero(self):
+        phrases = [Phrase(10_800.0 + minute * 60, 10_805.0 + minute * 60, f"м{minute}") for minute in range(0, 90)]
+        parts = transcript.windows(phrases, minutes=60, overlap_minutes=2)
+        self.assertEqual([(p[0].text, p[-1].text) for p in parts], [("м0", "м59"), ("м58", "м89")])
+
     def test_overlap_must_be_smaller_than_window(self):
         with self.assertRaises(ValueError):
             transcript.windows([Phrase(0, 1, "а")], minutes=10, overlap_minutes=10)
@@ -116,6 +121,14 @@ class AudioCommandTest(unittest.TestCase):
         command = audio.ffmpeg_command("ffmpeg", "src", Path("o-%03d.flac"), Path("l.csv"), limit_sec=1200)
         self.assertLess(command.index("-t"), command.index("-i"))
         self.assertEqual(command[command.index("-t") + 1], "1200")
+
+    def test_start_goes_before_input_and_shifts_chunk_times(self):
+        command = audio.ffmpeg_command("ffmpeg", "src", Path("o-%03d.flac"), Path("l.csv"), start_sec=3600, limit_sec=600)
+        self.assertLess(command.index("-ss"), command.index("-i"))
+        self.assertEqual(command[command.index("-ss") + 1], "3600")
+        self.assertNotIn("-ss", audio.ffmpeg_command("ffmpeg", "src", Path("o"), Path("l")))
+        chunks = audio.parse_listing("chunk-000.flac,0.0,600.0\nchunk-001.flac,600.0,900.0\n", Path("/d"), 3600)
+        self.assertEqual([(c.start, c.end) for c in chunks], [(3600.0, 4200.0), (4200.0, 4500.0)])
 
     def test_listing_gives_offsets_in_order(self):
         text = "chunk-001.flac,600.000000,1200.010000\nchunk-000.flac,0.000000,600.000000\n\nbroken\n"
