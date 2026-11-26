@@ -41,11 +41,19 @@ class ParseVerboseTest(unittest.TestCase):
 
     def test_filler_phrases_are_dropped_only_when_whisper_doubted_speech(self):
         phrases, dropped = self.parse(
-            seg("Продолжение следует...", no_speech=0.5),
+            seg("Подписывайтесь на канал!", no_speech=0.5),
             seg("Спасибо за просмотр!", no_speech=0.02),
         )
         self.assertEqual([p.text for p in phrases], ["Спасибо за просмотр!"])
         self.assertEqual(dropped["фраза из тишины"], 1)
+
+    def test_to_be_continued_alone_is_always_invented(self):
+        phrases, dropped = self.parse(
+            seg("Продолжение следует...", no_speech=0.01, logprob=-0.1),
+            seg("Там в конце написано, что продолжение следует, и всё", no_speech=0.01),
+        )
+        self.assertEqual([p.text for p in phrases], ["Там в конце написано, что продолжение следует, и всё"])
+        self.assertEqual(dropped["чужие субтитры"], 1)
 
     def test_end_never_before_start(self):
         phrases, _ = self.parse(seg("странно", 10.0, 9.0))

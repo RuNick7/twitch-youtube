@@ -15,6 +15,10 @@ class PromptTest(unittest.TestCase):
         self.assertIn("кат-сцены", timeline.SYSTEM)
         self.assertIn("озвучка донатов", timeline.SYSTEM)
         self.assertIn("если категория Twitch — игра", timeline.SYSTEM)
+        self.assertIn("Это video и тогда, когда стример много комментирует", timeline.SYSTEM)
+        self.assertIn("стоит на паузе и стример несколько минут говорит о другом, это talk", timeline.SYSTEM)
+        self.assertNotIn("это talk или game", timeline.SYSTEM)  # с этой фразой сцена фильма становилась «игрой»
+        self.assertIn("в категории Just Chatting «game» ставь, только когда ясно, что играет сам стример", timeline.SYSTEM)
 
 
 class ParseTimeTest(unittest.TestCase):
@@ -97,6 +101,27 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(timeline.render(moments).splitlines()[1], "0:40:00–1:00:00 (20 мин) video: фильм [low]")
 
 
+class BridgeVideoTest(unittest.TestCase):
+    def kinds(self, *rows):
+        return [m.kind for m in timeline.bridge_video([moment(a, b, kind) for a, b, kind in rows])]
+
+    def test_silence_inside_a_film_becomes_video(self):
+        self.assertEqual(self.kinds((0, 3000, "video"), (3000, 3180, "break"), (3180, 3300, "other"), (3300, 4000, "video")),
+                         ["video"] * 4)
+        bridged = timeline.bridge_video([moment(0, 600, "video"), moment(600, 900, "break"), moment(900, 1500, "video")])
+        self.assertEqual((bridged[1].kind, bridged[1].confidence, bridged[1].start, bridged[1].end), ("video", "low", 600, 900))
+
+    def test_talk_while_paused_stays_talk(self):
+        self.assertEqual(self.kinds((0, 600, "video"), (600, 840, "talk"), (840, 1500, "video")), ["video", "talk", "video"])
+        self.assertEqual(self.kinds((0, 600, "video"), (600, 700, "break"), (700, 840, "talk"), (840, 1500, "video")),
+                         ["video", "break", "talk", "video"])
+
+    def test_long_gap_and_edges_are_left_alone(self):
+        self.assertEqual(self.kinds((0, 600, "video"), (600, 1300, "break"), (1300, 2000, "video")), ["video", "break", "video"])
+        self.assertEqual(self.kinds((0, 300, "break"), (300, 900, "video"), (900, 1100, "other")), ["break", "video", "other"])
+        self.assertEqual(timeline.bridge_video([]), [])
+
+
 def phrases(minutes, step=60):
     return [Phrase(t * 1.0, t + 5.0, f"фраза {t}") for t in range(0, minutes * 60, step)]
 
@@ -139,6 +164,41 @@ class AnalyzeTest(unittest.TestCase):
         last = calls[-1]["user"]
         self.assertNotIn("Just Chatting", last)  # эта категория закончилась до начала окна
         self.assertIn("Minecraft", last)
+
+    def run_with_answers(self, *answers):
+        queue, calls = list(answers), []
+
+        async def ask(**kw):
+            calls.append(1)
+            end = queue.pop(0)
+            moments = [] if end is None else [{"start": "0:00:00", "end": end, "kind": "talk", "topic": "т", "confidence": "high"}]
+            return {"moments": moments}, claude.Usage(1, 10, 1, 0.001)
+
+        context = Context("Заквиель", "Стрим")
+        moments, usage = asyncio.run(timeline.analyze(phrases(50), context, ask))
+        return moments, usage, len(calls)
+
+    def test_answer_that_misses_part_of_the_window_is_requested_again(self):
+        moments, usage, calls = self.run_with_answers("0:10:00", "0:49:05")
+        self.assertEqual((calls, usage.requests, moments[-1].end), (2, 2, 49 * 60 + 5))
+
+    def test_second_bad_answer_keeps_the_better_one(self):
+        moments, _, calls = self.run_with_answers("0:30:00", None)
+        self.assertEqual((calls, [m.end for m in moments]), (2, [1800.0]))
+
+    def test_good_answer_is_not_repeated(self):
+        _, _, calls = self.run_with_answers("0:45:00")  # покрыто больше 80%
+        self.assertEqual(calls, 1)
+
+    def test_silence_inside_a_video_is_bridged_in_the_result(self):
+        async def ask(**kw):
+            rows = [("0:00:00", "0:20:00", "video", "фильм"), ("0:20:00", "0:25:00", "break", "тишина"),
+                    ("0:25:00", "0:49:05", "video", "фильм дальше")]
+            moments = [{"start": a, "end": b, "kind": kind, "topic": topic, "confidence": "high"} for a, b, kind, topic in rows]
+            return {"moments": moments}, claude.Usage(1, 10, 1, 0.001)
+
+        moments, _ = asyncio.run(timeline.analyze(phrases(50), Context("Заквиель", "Стрим"), ask))
+        self.assertEqual([m.kind for m in moments], ["video", "video", "video"])
 
     def test_no_phrases_no_requests(self):
         moments, usage, calls = self.run_analyze([])

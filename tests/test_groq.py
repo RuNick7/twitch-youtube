@@ -59,6 +59,23 @@ class TranscribeFileTest(unittest.TestCase):
         self.assertEqual(self.run_call(lambda request: answers.pop(0)), OK)
         self.sleep.assert_awaited_once_with(7.0)
 
+    def test_long_rate_limit_is_waited_out_beyond_retry_count(self):
+        answers = [httpx.Response(429, headers={"retry-after": "900"}, json={"error": {"message": "audio seconds per hour"}})
+                   for _ in range(groq.RETRIES + 3)] + [httpx.Response(200, json=OK)]
+        self.assertEqual(self.run_call(lambda request: answers.pop(0)), OK)
+        self.assertEqual([call.args[0] for call in self.sleep.await_args_list], [900.0] * (groq.RETRIES + 3))
+
+    def test_rate_limit_waiting_has_a_ceiling(self):
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            return httpx.Response(429, headers={"retry-after": "999999"}, json={"error": {"message": "day limit"}})
+
+        with self.assertRaisesRegex(groq.TranscribeError, "day limit"):
+            self.run_call(handler)
+        self.assertEqual(len(calls), int(groq.LIMIT_WAIT_MAX / groq.RETRY_AFTER_MAX) + 1)
+
     def test_server_errors_and_network_errors_are_retried(self):
         calls = []
 

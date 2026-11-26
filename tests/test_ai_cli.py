@@ -90,6 +90,24 @@ class AnalyzeCliTest(unittest.TestCase):
         self.assertEqual(result["effort"], "medium")
         self.assertIn("Расход: запросов 5", output)
 
+    def test_joined_segment_is_marked_up_span_by_span(self):
+        phrases = [transcript.Phrase(t * 60.0, t * 60.0 + 5, f"фраза {t}") for t in range(180)]
+        (self.folder / "transcript.json").write_text(transcript.dump(phrases))
+        info = vod_info(chapters=[
+            {"start_time": 0, "end_time": HOUR, "title": "Just Chatting"},
+            {"start_time": HOUR, "end_time": 2 * HOUR, "title": "Minecraft"},
+            {"start_time": 2 * HOUR, "end_time": 3 * HOUR, "title": "Just Chatting"}])
+        code, output = self.run_cli(info=info)
+        self.assertEqual(code, 0, output)
+        result = json.loads((self.folder / "analysis.json").read_text())
+        chat = result["segments"][0]
+        self.assertEqual(chat["spans"], [[0, 3600], [7200, 10800]])
+        for found in chat["moments"]:  # ни один момент не тянется через Minecraft посередине
+            self.assertTrue(found["end"] <= 3600 or found["start"] >= 7200, found)
+        self.assertEqual({m["start"] for m in chat["moments"]}, {0.0, 7200.0})
+        self.assertEqual(chat["coverage"], 1.0)
+        self.assertEqual(result["usage"]["requests"], 5)  # два отрезка разговора, Minecraft и два названия
+
     def test_name_option_and_uncovered_segment(self):
         info = vod_info(duration=4 * HOUR, chapters=[
             {"start_time": 0, "end_time": 1 * HOUR, "title": "Just Chatting"},

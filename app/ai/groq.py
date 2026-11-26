@@ -18,7 +18,9 @@ MIN_BILLED_SEC = 10  # запрос короче 10 секунд оплачив�
 RETRIES = 5
 TIMEOUT = httpx.Timeout(30.0, read=300.0, write=300.0)
 RETRY_AFTER_DEFAULT = 20.0
-RETRY_AFTER_MAX = 120.0
+RETRY_AFTER_MAX = 3600.0
+# На бесплатном тарифе есть лимит секунд звука в час: длинную запись приходится ждать, а не бросать
+LIMIT_WAIT_MAX = 3 * 3600.0
 
 
 class TranscribeError(RuntimeError):
@@ -58,7 +60,8 @@ async def transcribe_file(
 ) -> dict:
     """Расшифровка одного файла: ответ Groq в формате verbose_json (фразы со временем и оценками уверенности).
 
-    Лимит запросов (429) ждётся по заголовку retry-after, сбои сети и сервера повторяются.
+    Лимит запросов (429) ждётся по заголовку retry-after, в сумме не больше LIMIT_WAIT_MAX; сбои сети
+    и сервера повторяются RETRIES раз.
     """
     audio = path.read_bytes()
     form = {
@@ -71,7 +74,9 @@ async def transcribe_file(
     if prompt:
         form["prompt"] = prompt
     problem = ""
-    for attempt in range(RETRIES):
+    attempt = 0
+    limit_waited = 0.0
+    while attempt < RETRIES:
         wait = 2.0**attempt
         try:
             resp = await http.post(
@@ -96,7 +101,14 @@ async def transcribe_file(
                 raise TranscribeError(f"Groq отклонил файл {path.name}: {problem}")
             if resp.status_code == 429:
                 wait = _retry_after(resp)
-        if attempt + 1 < RETRIES:
+                if limit_waited + wait > LIMIT_WAIT_MAX:
+                    break
+                limit_waited += wait
+                log.info("Groq: лимит (%s), жду %.0f с", problem, wait)
+                await asyncio.sleep(wait)
+                continue  # ожидание лимита не считается неудачной попыткой
+        attempt += 1
+        if attempt < RETRIES:
             log.info("Groq: %s, повтор через %.0f с", problem, wait)
             await asyncio.sleep(wait)
     raise TranscribeError(f"Groq не ответил на {path.name}: {problem}")

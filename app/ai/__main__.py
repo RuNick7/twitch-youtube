@@ -155,8 +155,17 @@ async def run_analyze(args: argparse.Namespace) -> int:
                 row["skipped"] = f"нет расшифровки на этом участке (она есть только до {phrases[-1].end / 60:.0f}-й минуты)"
             else:
                 try:
-                    moments, used = await timeline.analyze(inside, context, ask, minutes=args.window, effort=args.effort)
-                    usage.add(used)
+                    # У склеенного ролика отрезки разнесены по записи: каждый размечается отдельно,
+                    # иначе момент растянулся бы через то, что стояло между ними
+                    moments, transcribed = [], 0.0
+                    for a, b in seg.spans:
+                        piece = [p for p in inside if a <= p.start < b]
+                        if not piece:
+                            continue
+                        found, used = await timeline.analyze(piece, context, ask, minutes=args.window, effort=args.effort)
+                        usage.add(used)
+                        moments += found
+                        transcribed += piece[-1].end - piece[0].start
                     middle, reason, used = await titles.suggest(
                         ask, streamer=name, stream_title=stream_title, category=seg.category, moments=moments,
                         effort=args.effort,
@@ -169,7 +178,7 @@ async def run_analyze(args: argparse.Namespace) -> int:
                     break
                 row.update(
                     moments=[asdict(m) for m in moments],
-                    coverage=round(timeline.coverage(moments, inside[0].start, inside[-1].end), 2),
+                    coverage=round(timeline.coverage(moments, 0, transcribed), 2),
                     middle=middle, middle_rejected=reason,
                     title=titles.compose(seg.category, middle, stream_title, name),
                     title_now=segments.build_title(seg.category, stream_title, name),

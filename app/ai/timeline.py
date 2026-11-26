@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, replace
 from typing import Awaitable, Callable, Sequence
@@ -13,11 +14,18 @@ from ..segments import clean_line
 from . import claude, transcript
 from .transcript import Phrase
 
+log = logging.getLogger(__name__)
+
 KINDS = ("game", "talk", "video", "break", "other")
 CONFIDENCE = ("high", "medium", "low")
 MIN_MOMENT_SEC = 120  # короче — приклеивается к соседнему
 TOPIC_MAX_CHARS = 120
 MAX_TOKENS = 8000
+MIN_COVERAGE = 0.8  # моменты должны покрывать окно хотя бы настолько, иначе запрос повторяется
+ATTEMPTS = 2
+# «Перерыв» или «другое» не длиннее этого между двумя кусками видео — тоже видео: Twitch глушит музыку фильма,
+# в тексте остаётся дыра. Разговор так не склеивается: пока видео на паузе, кусок можно оставить в ролике
+VIDEO_GAP_SEC = 600
 
 SYSTEM = """Ты размечаешь по времени расшифровку записи стрима на Twitch: что происходит в каждый отрезок.
 
@@ -25,13 +33,14 @@ SYSTEM = """Ты размечаешь по времени расшифровку
 
 Верни моменты: подряд идущие отрезки, которые вместе покрывают весь участок. У каждого момента:
 - start и end: время в формате H:MM:SS; следующий момент начинается там, где закончился предыдущий;
-- kind: «game» — стример играет и комментирует игру (речь и кат-сцены персонажей игры тоже относятся к game); «talk» — разговор с чатом, истории, новости, обсуждение, вопросы; «video» — стример отвлёкся от игры или разговора и смотрит или слушает постороннее видео, фильм, сериал, клип или чужой стрим (признаки: долгая связная речь, не похожая на разговор стримера: закадровый голос, диалоги сюжета, реклама, чужая манера; сам стример молчит или коротко комментирует); «break» — перерыв, пауза, тишина, музыка; «other» — всё остальное;
+- kind: «game» — стример играет и комментирует игру (речь и кат-сцены персонажей игры тоже относятся к game); «talk» — разговор с чатом, истории, новости, обсуждение, вопросы; «video» — стример отвлёкся от игры или разговора и смотрит или слушает постороннее видео, фильм, сериал, клип или чужой стрим (признаки: долгая связная речь, не похожая на разговор стримера: закадровый голос, диалоги сюжета, реклама, чужая манера; сам стример молчит или коротко комментирует). Это video и тогда, когда стример много комментирует то, что идёт на экране: актёров, сюжет, звук. Если же видео ещё не запущено или стоит на паузе и стример несколько минут говорит о другом, это talk; «break» — перерыв, пауза, тишина, музыка; «other» — всё остальное;
 - topic: о чём этот отрезок, одной фразой по-русски до 80 символов, конкретно («обсуждают рекламу GTA 6 и PlayStation», а не «разговор»);
 - confidence: «high», «medium» или «low».
 
 Правила:
 - новый момент начинается, когда меняется занятие или тема разговора; отрезки короче 2 минут не выделяй, присоединяй к соседним;
 - если категория Twitch — игра, речь персонажей и кат-сцены игры — это game, а не video; video ставь, только когда по тексту ясно, что стример смотрит постороннее видео;
+- в категории Just Chatting «game» ставь, только когда ясно, что играет сам стример: стрельба, взрывы и опасности в диалогах фильма — это video;
 - озвучка донатов (синтезированный голос читает сообщение зрителя, часто с суммой) — часть текущего занятия, не video;
 - не уверен, что идёт видео, — ставь talk или game и confidence low;
 - мат, оскорбления и дословные цитаты из расшифровки не повторяй: называй тему нейтрально;
@@ -187,6 +196,22 @@ def combine(parts: Sequence[Sequence[Moment]], min_sec: float = MIN_MOMENT_SEC) 
     return merge_short(merge_same(result), min_sec)
 
 
+def bridge_video(moments: Sequence[Moment], max_gap: float = VIDEO_GAP_SEC) -> list[Moment]:
+    """Дыры без речи внутри просмотра видео помечаются как видео (с низкой уверенностью)."""
+    result = list(moments)
+    previous_video = None
+    for i, moment in enumerate(result):
+        if moment.kind == "video":
+            if previous_video is not None:
+                between = result[previous_video + 1 : i]
+                if between and all(m.kind in ("break", "other") for m in between) and (
+                    moment.start - result[previous_video].end <= max_gap
+                ):
+                    result[previous_video + 1 : i] = [replace(m, kind="video", confidence="low") for m in between]
+            previous_video = i
+    return result
+
+
 def render(moments: Sequence[Moment]) -> str:
     lines = []
     for m in moments:
@@ -209,13 +234,24 @@ async def analyze(
     usage = claude.Usage()
     parts = []
     for window in transcript.windows(phrases, minutes, overlap):
-        data, used = await ask(
-            system=SYSTEM,
-            user=build_user_prompt(context, window),
-            schema=SCHEMA,
-            effort=effort,
-            max_tokens=MAX_TOKENS,
-        )
-        usage.add(used)
-        parts.append(parse_moments(data, window[0].start, window[-1].end))
-    return combine(parts), usage
+        start, end = window[0].start, window[-1].end
+        best: list[Moment] = []
+        for attempt in range(1, ATTEMPTS + 1):
+            data, used = await ask(
+                system=SYSTEM,
+                user=build_user_prompt(context, window),
+                schema=SCHEMA,
+                effort=effort,
+                max_tokens=MAX_TOKENS,
+            )
+            usage.add(used)
+            found = parse_moments(data, start, end)
+            if coverage(found, start, end) >= coverage(best, start, end):
+                best = found
+            if coverage(best, start, end) >= MIN_COVERAGE:
+                break
+            # Изредка модель возвращает моменты не на весь участок: без проверки кусок записи молча пропадал бы
+            log.warning("Участок %s–%s: моменты покрывают %.0f%% (попытка %d из %d)", transcript.fmt_time(start),
+                        transcript.fmt_time(end), coverage(found, start, end) * 100, attempt, ATTEMPTS)
+        parts.append(best)
+    return bridge_video(combine(parts)), usage
