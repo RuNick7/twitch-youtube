@@ -13,14 +13,17 @@ from .context import App
 from .db import Streamer, all_streamers
 from .ui import accept_action, confirm_keyboard, render_consent
 
-# 1 — загрузка и публикация роликов, 2 — плейлисты по категориям, 3 — Shorts из клипов
-CONSENT_VERSION = 3
+# 1 — загрузка и публикация роликов, 2 — плейлисты по категориям, 3 — Shorts из клипов,
+# 4 — автопубликация роликов с ограничением 18+ и блокировкой в немногих странах
+CONSENT_VERSION = 4
 PLAYLISTS_SINCE = 2
 SHORTS_SINCE = 3
+RESTRICTED_SINCE = 4
 # Что нового в версии: это бот перечисляет, когда просит принять обновлённую политику
 CHANGES = {
     PLAYLISTS_SINCE: "раскладывает опубликованные ролики по плейлистам категорий",
     SHORTS_SINCE: "делает Shorts из самых просматриваемых клипов канала",
+    RESTRICTED_SINCE: "сам публикует ролики с ограничением 18+ и с блокировкой в немногих странах",
 }
 
 

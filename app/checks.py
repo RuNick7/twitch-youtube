@@ -73,20 +73,36 @@ def failure_reason(item: dict) -> str:
     return details.get("processingFailureReason") or "YouTube не смог обработать ролик"
 
 
-def youtube_warnings(item: dict, expected_sec: Optional[float]) -> List[str]:
-    """Что мешает публиковать ролик без решения человека."""
+def youtube_warnings(
+    item: dict, expected_sec: Optional[float], *, allow_age: bool = False, allow_blocked: int = 0
+) -> List[str]:
+    """Что мешает публиковать ролик без решения человека.
+
+    Ограничение 18+ при allow_age и блокировка не больше чем в allow_blocked странах не мешают: их перечисляет
+    youtube_notes. Список разрешённых стран (вместо запрещённых) всегда ждёт решения.
+    """
+    return _inspect(item, expected_sec, allow_age, allow_blocked)[0]
+
+
+def youtube_notes(item: dict, *, allow_age: bool = False, allow_blocked: int = 0) -> List[str]:
+    """Ограничения ролика, с которыми его всё равно разрешено публиковать без решения человека."""
+    return _inspect(item, None, allow_age, allow_blocked)[1]
+
+
+def _inspect(item: dict, expected_sec: Optional[float], allow_age: bool, allow_blocked: int) -> tuple[List[str], List[str]]:
     warnings: List[str] = []
+    notes: List[str] = []
     details = item.get("contentDetails") or {}
     restriction = details.get("regionRestriction") or {}
     blocked = restriction.get("blocked") or []
     if blocked:
         shown = ", ".join(blocked[:10]) + (" и другие" if len(blocked) > 10 else "")
-        warnings.append(f"заблокирован в {len(blocked)} странах: {shown}")
+        (notes if len(blocked) <= allow_blocked else warnings).append(f"заблокирован в {len(blocked)} странах: {shown}")
     if "allowed" in restriction:
         warnings.append(f"доступен только в {len(restriction['allowed'] or [])} странах")
     if (details.get("contentRating") or {}).get("ytRating") == "ytAgeRestricted":
-        warnings.append("возрастное ограничение 18+")
+        (notes if allow_age else warnings).append("возрастное ограничение 18+")
     actual = parse_duration(details.get("duration"))
     if expected_sec and actual is not None and abs(actual - expected_sec) > max(30.0, expected_sec * 0.01):
         warnings.append(f"длительность {fmt_duration(actual)} вместо {fmt_duration(expected_sec)}")
-    return warnings
+    return warnings, notes

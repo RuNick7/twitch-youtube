@@ -375,9 +375,45 @@ def joined(*chapters, **kwargs):
 
 
 class JoinRepeatedTest(unittest.TestCase):
-    def test_same_category_of_one_stream_becomes_one_video(self):
+    def test_short_break_does_not_split_a_video(self):
         self.assertEqual(
-            joined((0, 2400, "Just Chatting"), (2400, 18000, "Minecraft"), (18000, 27000, "Just Chatting")),
+            joined((0, 2400, "Minecraft"), (2400, 3000, "Just Chatting"), (3000, 9000, "Minecraft")),
+            [
+                ("Minecraft", [(0, 2400), (3000, 9000)], 8400),
+                ("Just Chatting", [(2400, 3000)], 600),  # другая категория в чужой ролик не попадает
+            ],
+        )
+
+    def test_break_of_exactly_fifteen_minutes_is_still_short(self):
+        self.assertEqual(len(joined((0, 3600, "A"), (3600, 4500, "B"), (4500, 8100, "A"))), 2)
+        self.assertEqual(len(joined((0, 3600, "A"), (3600, 4501, "B"), (4501, 8100, "A"))), 3)
+
+    def test_return_after_another_long_game_starts_a_new_video(self):
+        self.assertEqual(
+            joined((0, 2444, "Just Chatting"), (2444, 6914, "Minecraft"), (6914, 14452, "Crystal of Atlan"),
+                   (14452, 20060, "Minecraft")),
+            [
+                ("Just Chatting", [(0, 2444)], 2444),
+                ("Minecraft", [(2444, 6914)], 4470),
+                ("Crystal of Atlan", [(6914, 14452)], 7538),
+                ("Minecraft", [(14452, 20060)], 5608),
+            ],
+        )
+
+    def test_break_is_counted_from_the_last_joined_piece(self):
+        result = joined((0, 3600, "A"), (3600, 4200, "B"), (4200, 7800, "A"), (7800, 8400, "B"), (8400, 12000, "A"),
+                        (12000, 20000, "C"), (20000, 24000, "A"))
+        self.assertEqual([(category, spans) for category, spans, _ in result], [
+            ("A", [(0, 3600), (4200, 7800), (8400, 12000)]),
+            ("B", [(3600, 4200)]),  # между разговорами прошёл час игры
+            ("B", [(7800, 8400)]),
+            ("C", [(12000, 20000)]),
+            ("A", [(20000, 24000)]),
+        ])
+
+    def test_longer_break_can_be_allowed(self):
+        self.assertEqual(
+            joined((0, 2400, "Just Chatting"), (2400, 18000, "Minecraft"), (18000, 27000, "Just Chatting"), join_gap=5 * 3600),
             [
                 ("Just Chatting", [(0, 2400), (18000, 27000)], 11400),
                 ("Minecraft", [(2400, 18000)], 15600),
@@ -410,7 +446,7 @@ class JoinRepeatedTest(unittest.TestCase):
 
     def test_too_long_joined_video_is_split_across_fragments(self):
         hours = 3600
-        result = joined((0, 8 * hours, "A"), (8 * hours, 9 * hours, "B"), (9 * hours, 17 * hours, "A"))
+        result = joined((0, 8 * hours, "A"), (8 * hours, 9 * hours, "B"), (9 * hours, 17 * hours, "A"), join_gap=hours)
         self.assertEqual(
             result,
             [("A", [(0, 8 * hours)], 8 * hours), ("A", [(9 * hours, 17 * hours)], 8 * hours), ("B", [(8 * hours, 9 * hours)], hours)],
@@ -418,7 +454,7 @@ class JoinRepeatedTest(unittest.TestCase):
 
     def test_split_point_inside_second_fragment(self):
         hours = 3600
-        result = joined((0, 2 * hours, "A"), (2 * hours, 3 * hours, "B"), (3 * hours, 13 * hours, "A"))
+        result = joined((0, 2 * hours, "A"), (2 * hours, 3 * hours, "B"), (3 * hours, 13 * hours, "A"), join_gap=hours)
         # 12 часов одной категории — два ролика по 6 часов: 2 + 4 и ещё 6
         self.assertEqual(result[0][1], [(0, 2 * hours), (3 * hours, 7 * hours)])
         self.assertEqual(result[1][1], [(7 * hours, 13 * hours)])

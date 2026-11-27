@@ -8,6 +8,7 @@ from app.checks import (
     failure_reason,
     parse_duration,
     processing_state,
+    youtube_notes,
     youtube_warnings,
 )
 
@@ -77,6 +78,31 @@ class WarningsTest(unittest.TestCase):
     def test_age_restriction(self):
         warnings = youtube_warnings(item(details={"contentRating": {"ytRating": "ytAgeRestricted"}}), None)
         self.assertEqual(warnings, ["возрастное ограничение 18+"])
+
+    def test_allowed_restrictions_do_not_block_publication(self):
+        video = item(details={"regionRestriction": {"blocked": [f"C{i}" for i in range(10)]},
+                              "contentRating": {"ytRating": "ytAgeRestricted"}})
+        allowed = {"allow_age": True, "allow_blocked": 10}
+        self.assertEqual(youtube_warnings(video, 3600, **allowed), [])
+        notes = youtube_notes(video, **allowed)
+        self.assertEqual(len(notes), 2)
+        self.assertIn("в 10 странах", notes[0])
+        self.assertEqual(notes[1], "возрастное ограничение 18+")
+        self.assertEqual(youtube_notes(video), [])
+        self.assertEqual(len(youtube_warnings(video, 3600)), 2)
+
+    def test_more_countries_than_allowed_need_a_decision(self):
+        video = item(details={"regionRestriction": {"blocked": [f"C{i}" for i in range(11)]}})
+        self.assertIn("в 11 странах", youtube_warnings(video, None, allow_blocked=10)[0])
+        self.assertEqual(youtube_notes(video, allow_blocked=10), [])
+
+    def test_list_of_allowed_countries_always_needs_a_decision(self):
+        video = item(details={"regionRestriction": {"allowed": ["RU"]}})
+        self.assertEqual(len(youtube_warnings(video, None, allow_age=True, allow_blocked=300)), 1)
+
+    def test_wrong_duration_is_never_allowed(self):
+        video = item(duration="PT30M", details={"contentRating": {"ytRating": "ytAgeRestricted"}})
+        self.assertEqual(youtube_warnings(video, 3600, allow_age=True, allow_blocked=10), ["длительность 30 мин вместо 1 ч"])
 
     def test_duration_mismatch(self):
         self.assertEqual(youtube_warnings(item(duration="PT30M"), 3600), ["длительность 30 мин вместо 1 ч"])

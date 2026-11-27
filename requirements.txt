@@ -5,6 +5,8 @@ httpx>=0.27,<1
 pydantic-settings>=2.4,<3
 SQLAlchemy[asyncio]>=2.0.30,<3
 tzdata
+# Claude Haiku: название и таймкоды по расшифровке (app/ai)
+anthropic>=2,<3
 # статическая сборка ffmpeg: вертикальные Shorts из клипов
 imageio-ffmpeg>=0.5
 # при старте контейнера и раз в сутки обновляется до свежей сборки

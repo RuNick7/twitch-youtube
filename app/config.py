@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     # Публикация: ролик без предупреждений становится публичным через publish_delay_min
     # после того, как YouTube его обработал (время на проверку Content ID)
     auto_publish: bool = True
+    # Что не мешает автопубликации: ограничение 18+ и блокировка не больше чем в стольких странах (0 — любая
+    # блокировка ждёт решения). Действует, когда владелец канала принял политику, где это описано
+    auto_publish_age_restricted: bool = True
+    auto_publish_max_blocked: int = 10
     publish_privacy: Literal["public", "unlisted"] = "public"
     publish_delay_min: int = 60
     # Сколько дней после публикации следить, не заблокировал ли YouTube ролик
@@ -75,8 +79,10 @@ class Settings(BaseSettings):
     # Короче min_segment_sec — приклеить к соседнему, короче skip_shorter_min — не загружать
     min_segment_sec: int = 120
     skip_shorter_min: int = 7
-    # Куски одного стрима с той же категорией и тем же названием — один ролик
+    # Куски одного стрима с той же категорией и тем же названием — один ролик, если между ними прошло
+    # не больше join_max_gap_min минут: после долгой другой игры начинается новый ролик
     join_repeated: bool = True
+    join_max_gap_min: int = 15
     # Категории, у которых в названии ролика не пишется «часть N»
     no_part_categories: str = "Just Chatting,Minecraft"
 
@@ -119,6 +125,8 @@ class Settings(BaseSettings):
 # Настройки, которые можно задать стримеру отдельно (Streamer.overrides). Остальные общие для всех стримеров
 STREAMER_FIELDS = (
     "auto_publish",
+    "auto_publish_age_restricted",
+    "auto_publish_max_blocked",
     "publish_privacy",
     "publish_delay_min",
     "monitor_days",
@@ -132,6 +140,7 @@ STREAMER_FIELDS = (
     "min_segment_sec",
     "skip_shorter_min",
     "join_repeated",
+    "join_max_gap_min",
     "no_part_categories",
     "skip_title_keywords",
     "skip_title_categories",

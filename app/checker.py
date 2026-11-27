@@ -10,7 +10,9 @@ from html import escape
 import httpx
 from sqlalchemy import select
 
-from .checks import FAILED, READY, REJECTED, failure_reason, processing_state, youtube_warnings
+from .checks import FAILED, READY, REJECTED, failure_reason, processing_state, youtube_notes, youtube_warnings
+from .consent import RESTRICTED_SINCE, accepted_version
+from .config import Settings
 from .context import App
 from .db import SHORT, Segment, Status, Streamer, Vod, as_utc, dump_warnings, get_warnings, utcnow
 from .service import MONITOR_EVERY, publish, update_segment
@@ -27,6 +29,13 @@ AUTH_BACKOFF = timedelta(minutes=10)
 
 def _unique(items: list[str]) -> list[str]:
     return list(dict.fromkeys(items))
+
+
+def _allowed(settings: Settings, streamer: Streamer) -> dict:
+    """Какие ограничения YouTube не мешают автопубликации. Без согласия с новой политикой — никакие."""
+    if not settings.auto_publish or accepted_version(streamer) < RESTRICTED_SINCE:
+        return {"allow_age": False, "allow_blocked": 0}
+    return {"allow_age": settings.auto_publish_age_restricted, "allow_blocked": settings.auto_publish_max_blocked}
 
 
 class Checker:
@@ -118,14 +127,16 @@ class Checker:
                 await update_segment(app, seg.id, check_at=now + RECHECK)
             return
 
+        allowed = _allowed(settings, streamer)
         if seg.status == Status.WAITING:
-            warnings = get_warnings(seg) + youtube_warnings(item, seg.expected_duration)
+            warnings = get_warnings(seg) + youtube_warnings(item, seg.expected_duration, **allowed)
             if seg.force_review:
                 warnings.append(f"загружен вручную, хотя фильтр его пропустил: {seg.reason or 'причина не сохранилась'}")
             if not warnings and not settings.auto_publish:
                 warnings.append("автопубликация выключена (AUTO_PUBLISH=false)")
             if warnings:
-                warnings = _unique(warnings)
+                # Решая, публиковать ли, владелец видит все ограничения, в том числе разрешённые
+                warnings = _unique(warnings + youtube_notes(item, **allowed))
                 await update_segment(app, seg.id, status=Status.REVIEW, warnings=dump_warnings(warnings), check_at=None)
                 await app.refresh_segment(seg.id)
                 lines = "\n".join(f"• {escape(w)}" for w in warnings)
@@ -137,23 +148,33 @@ class Checker:
             if await is_paused(app, streamer.id):
                 await update_segment(app, seg.id, check_at=now + RECHECK)
                 return
-            await publish(app, seg.id)
+            await publish(app, seg.id, notes=youtube_notes(item, **allowed))
             return
 
         if seg.status == Status.PUBLISHED:
-            problems = youtube_warnings(item, None)
+            problems = youtube_warnings(item, None, **allowed)
             privacy = (item.get("status") or {}).get("privacyStatus")
             if privacy != settings.publish_privacy:
                 problems.append(f"ролик стал {PRIVACY_NAMES.get(privacy, privacy)}")
             known = get_warnings(seg)
             new = [problem for problem in problems if problem not in known]
+            # Допустимое ограничение, появившееся уже после публикации, — сообщение без звука
+            noted = [note for note in youtube_notes(item, **allowed) if note not in known]
             next_check = now + MONITOR_EVERY
             values: dict = {"check_at": next_check if seg.monitor_until and next_check <= as_utc(seg.monitor_until) else None}
-            if new:
-                values["warnings"] = dump_warnings(known + new)
+            if new or noted:
+                values["warnings"] = dump_warnings(known + new + noted)
             await update_segment(app, seg.id, **values)
-            if new:
+            if new or noted:
                 await app.refresh_segment(seg.id)
+            if noted:
+                lines = "\n".join(f"• {escape(n)}" for n in noted)
+                await app.notify(
+                    f"ℹ️ У опубликованного ролика «{escape(seg.title)}» появилось ограничение, он остаётся открытым:\n{lines}",
+                    reply_to=seg.tg_message_id,
+                    silent=True,
+                )
+            if new:
                 lines = "\n".join(f"• {escape(p)}" for p in new)
                 await app.notify(
                     f"🔴 С опубликованным роликом «{escape(seg.title)}» проблема:\n{lines}",
