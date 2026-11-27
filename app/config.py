@@ -75,8 +75,10 @@ class Settings(BaseSettings):
     # Короче min_segment_sec — приклеить к соседнему, короче skip_shorter_min — не загружать
     min_segment_sec: int = 120
     skip_shorter_min: int = 7
-    # Куски одного стрима с той же категорией и тем же названием — один ролик
+    # Куски одного стрима с той же категорией и тем же названием — один ролик, если между ними прошло
+    # не больше join_max_gap_min минут: после долгой другой игры начинается новый ролик
     join_repeated: bool = True
+    join_max_gap_min: int = 15
     # Категории, у которых в названии ролика не пишется «часть N»
     no_part_categories: str = "Just Chatting,Minecraft"
 
@@ -132,6 +134,7 @@ STREAMER_FIELDS = (
     "min_segment_sec",
     "skip_shorter_min",
     "join_repeated",
+    "join_max_gap_min",
     "no_part_categories",
     "skip_title_keywords",
     "skip_title_categories",

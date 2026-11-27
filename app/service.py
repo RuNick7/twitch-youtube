@@ -103,7 +103,12 @@ async def ingest_vod(app: App, info: VodInfo, login: str | None = None) -> int:
     settings = app.config(streamer)
 
     chapters = split_by_titles(normalize_chapters(info.chapters, info.duration), await title_marks(app, info, channel))
-    planned = plan_segments(chapters, min_sec=settings.min_segment_sec, join=settings.join_repeated)
+    planned = plan_segments(
+        chapters,
+        min_sec=settings.min_segment_sec,
+        join=settings.join_repeated,
+        join_gap=settings.join_max_gap_min * 60,
+    )
     stream_titles = [p.stream_title or info.title for p in planned]
     reasons = [
         skip_reason(

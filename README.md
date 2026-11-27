@@ -89,7 +89,7 @@ docker compose up -d --build
 
 Раз в 5 минут бот проверяет каналы стримеров, а пока идёт стрим, раз в минуту запоминает его название. Через 10 минут после конца стрима он режет VOD по сменам категории и названия:
 
-- куски с той же категорией и тем же названием склеиваются в один ролик — например, Just Chatting в начале и в конце стрима;
+- куски с той же категорией и тем же названием склеиваются в один ролик, если между ними прошло не больше 15 минут: игра, прерванная коротким разговором, остаётся одним роликом, а возвращение к ней после долгой другой игры — новый ролик;
 - кусок короче 2 минут (случайное переключение, исправленная опечатка) приклеивается к соседнему, а ролик короче 7 минут не загружается;
 - Just Chatting, в названии которого упомянут сериал или фильм, не загружается.
 
@@ -153,7 +153,7 @@ docker compose up -d --build
 - публикация: `auto_publish`, `publish_privacy`, `publish_delay_min`, `monitor_days`;
 - YouTube: `youtube_language`, `youtube_category_id`, `playlists`;
 - Shorts: `shorts`, `shorts_min_views`, `shorts_per_day`, `shorts_publish_delay_min`;
-- нарезка: `min_segment_sec`, `skip_shorter_min`, `join_repeated`, `no_part_categories`;
+- нарезка: `min_segment_sec`, `skip_shorter_min`, `join_repeated`, `join_max_gap_min`, `no_part_categories`;
 - фильтры: `skip_title_keywords`, `skip_title_categories`, `skip_categories`, `warn_categories`.
 
 Когда стримеров несколько, в сообщениях о стримах, роликах и Shorts есть имя и хештег стримера (`#логин`): по хештегу в чате находятся все его сообщения.

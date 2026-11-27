@@ -17,6 +17,8 @@ TITLE_MAX_CHARS = 100
 PLAYLIST_TITLE_MAX_CHARS = 150
 DESCRIPTION_MAX_BYTES = 5000
 TAGS_MAX_CHARS = 500
+# Куски одной категории склеиваются в один ролик, только если между ними прошло не больше этого
+JOIN_MAX_GAP_SEC = 15 * 60
 FALLBACK_CATEGORY = "Стрим"
 
 
@@ -111,14 +113,16 @@ def plan_segments(
     min_sec: int = 120,
     split_limit: int = SPLIT_LIMIT_SEC,
     join: bool = False,
+    join_gap: int = JOIN_MAX_GAP_SEC,
 ) -> List[PlannedSegment]:
     """Каждая смена категории или названия стрима — отдельный сегмент.
 
     Куски короче min_sec (случайное переключение категории, исправленная
     опечатка в названии) приклеиваются к предыдущему сегменту, а в начале
     стрима — к следующему. С join повторы с той же категорией и тем же
-    названием склеиваются в один ролик из нескольких отрезков. Сегменты
-    длиннее split_limit делятся на равные части. Номера частей — number_parts.
+    названием, между которыми не больше join_gap секунд, склеиваются в один
+    ролик из нескольких отрезков. Сегменты длиннее split_limit делятся на
+    равные части. Номера частей — number_parts.
     """
     segments = _merge_same(
         [
@@ -141,7 +145,7 @@ def plan_segments(
         segments = _merge_same(segments)
 
     if join:
-        segments = _join_repeated(segments)
+        segments = _join_repeated(segments, join_gap)
 
     result: List[PlannedSegment] = []
     for seg in segments:
@@ -213,17 +217,21 @@ def _merge_same(segments: List[PlannedSegment]) -> List[PlannedSegment]:
     return merged
 
 
-def _join_repeated(segments: List[PlannedSegment]) -> List[PlannedSegment]:
-    """Сегменты с той же категорией и тем же названием — в один ролик; порядок по первому появлению."""
-    joined: dict = {}
+def _join_repeated(segments: List[PlannedSegment], max_gap: int) -> List[PlannedSegment]:
+    """Короткий перерыв не разрывает ролик: повтор той же категории с тем же названием не позже чем через max_gap
+    секунд приклеивается к прошлому куску. То, что было между ними, в ролик не входит. Порядок — по началу роликов.
+    """
+    result: List[PlannedSegment] = []
+    last: dict = {}  # категория и название -> последний ролик с ними
     for seg in segments:
-        if seg.key in joined:
-            target = joined[seg.key]
+        target = last.get(seg.key)
+        if target is not None and seg.start - target.end <= max_gap:
             target.ranges = target.spans + [(seg.start, seg.end)]
             target.end = seg.end
         else:
-            joined[seg.key] = PlannedSegment(seg.start, seg.end, seg.category, stream_title=seg.stream_title)
-    return list(joined.values())
+            last[seg.key] = target = PlannedSegment(seg.start, seg.end, seg.category, stream_title=seg.stream_title)
+            result.append(target)
+    return result
 
 
 def _cut_spans(spans: List[Tuple[int, int]], cuts: List[int]) -> List[List[Tuple[int, int]]]:

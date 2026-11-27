@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 try:
     from app.config import Settings, change_override, describe_settings, streamer_settings
+    from app.segments import JOIN_MAX_GAP_SEC
     from app.twitch import TwitchError, live_states
 except ImportError:  # без зависимостей из requirements.txt: эти тесты идут в тестовом образе
     raise unittest.SkipTest("нужны pydantic-settings и httpx")
@@ -111,6 +112,16 @@ class ChangeOverrideTest(unittest.TestCase):
 
 LIVE = {"login": "zakvielchannel", "stream": {"id": "1", "createdAt": "2026-10-02T13:13:00Z"},
         "broadcastSettings": {"title": " Спидран PORTAL "}}
+
+
+class JoinBreakSettingTest(unittest.TestCase):
+    def test_default_is_fifteen_minutes_and_can_be_changed_per_streamer(self):
+        self.assertEqual(base_settings().join_max_gap_min * 60, JOIN_MAX_GAP_SEC)
+        self.assertEqual(JOIN_MAX_GAP_SEC, 15 * 60)
+        changed = change_override(None, "join_max_gap_min", "30")
+        self.assertEqual(streamer_settings(base_settings(), changed).join_max_gap_min, 30)
+        with self.assertRaises(ValueError):
+            change_override(None, "join_max_gap_min", "-5")
 
 
 class LiveStatesTest(unittest.TestCase):
