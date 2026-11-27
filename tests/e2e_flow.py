@@ -271,7 +271,11 @@ class FakeTelegram(BaseSession):
             self.problems.append(f"неожиданный метод {name}")
         result = True
         if name == "GetMe":
-            result = {"id": 123456, "is_bot": True, "first_name": "Test", "username": "test_bot"}
+            # Новые aiogram ждут здесь BotFullInfo с обязательными флагами, и список растёт вместе с Bot API,
+            # поэтому берём его из модели установленной версии
+            flags = {key: False for key, field in method.__returning__.model_fields.items()
+                     if field.is_required() and field.annotation is bool}
+            result = {**flags, "id": 123456, "is_bot": True, "first_name": "Test", "username": "test_bot"}
         elif name == "SendMessage":
             self.next_message_id += 1
             mid = self.next_message_id
