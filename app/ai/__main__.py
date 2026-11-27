@@ -1,18 +1,19 @@
 """Проверка нейросетей на настоящей записи, без запуска бота.
 
-Шаг 1, расшифровка (ключ Groq):
+Шаг 1, расшифровка (ключ OpenRouter; с ключом Groq он становится запасным):
 
-    GROQ_API_KEY=... python -m app.ai transcribe <ID записи Twitch> [--start 60] [--minutes 20]
+    OPENROUTER_API_KEY=... python -m app.ai transcribe <ID записи Twitch> [--start 60] [--minutes 20]
 
 пишет в <папка>/<ID записи> transcript.json, transcript.txt (то, что увидит языковая модель) и report.json
-(время, размеры, цена, сколько фраз отброшено и почему).
+(время, размеры, каким сервисом, цена, сколько фраз отброшено и почему).
 
 Шаги 2 и 3, таймкоды и названия по готовой расшифровке (ключ Anthropic):
 
     ANTHROPIC_API_KEY=... python -m app.ai analyze <ID записи Twitch>
 
 режет запись на сегменты так же, как бот (по главам Twitch), и для каждого сегмента показывает моменты (игра,
-разговор, чужое видео, перерыв) и предложенное название; пишет analysis.json и analysis.md.
+разговор, чужое видео, перерыв), главы для описания YouTube и название из главных тем; пишет analysis.json. С ключом
+--no-join куски одной категории не склеиваются в один ролик.
 
 Видео не скачивается, ключи нигде не сохраняются.
 """
@@ -27,6 +28,7 @@ import logging
 import os
 import shutil
 import sys
+import textwrap
 import time
 from collections import Counter
 from dataclasses import asdict
@@ -36,16 +38,19 @@ import httpx
 
 from .. import segments, tools
 from ..tools import ToolError
-from . import audio, claude, groq, timeline, titles, transcript
+from . import audio, claude, speech, timeline, titles, transcript
+from . import chapters as video_chapters
+from .recognizer import SERVICES, Recognizer
 
 MIN_SEGMENT_SEC = 120  # как min_segment_sec у бота
 SKIP_SHORTER_SEC = 7 * 60  # как skip_shorter_min у бота: такие ролики не загружаются
 
 
 async def run_transcribe(args: argparse.Namespace) -> int:
-    key = os.environ.get("GROQ_API_KEY", "").strip()
-    if not key:
-        print("Нужна переменная окружения GROQ_API_KEY.")
+    recognizer = Recognizer.from_env(os.environ, None if args.service == "auto" else args.service)
+    if not recognizer.keys:
+        needed = SERVICES.values() if args.service == "auto" else [SERVICES[args.service]]
+        print(f"Нужна переменная окружения {' или '.join(needed)}.")
         return 2
     out = Path(args.out) / args.vod_id.lstrip("v")
     out.mkdir(parents=True, exist_ok=True)
@@ -70,32 +75,38 @@ async def run_transcribe(args: argparse.Namespace) -> int:
 
     phrases: list[transcript.Phrase] = []
     dropped: Counter = Counter()
+    used: Counter = Counter()  # сколько кусков расшифровал каждый сервис
+    spent = 0.0
     chunk_reports = []
     async with httpx.AsyncClient() as http:
         for number, chunk in enumerate(chunks, 1):
             began = time.monotonic()
             try:
-                data = await groq.transcribe_file(http, key, chunk.path, model=args.model, language=args.language)
-            except groq.TranscribeError as exc:
+                result = await recognizer.transcribe(http, chunk.path, chunk.duration, language=args.language)
+            except speech.TranscribeError as exc:
                 print(f"Кусок {number}: {exc}")
                 return 1
-            part, part_dropped = transcript.parse_verbose(data, chunk.start)
+            part, part_dropped = transcript.parse_verbose(result.data, chunk.start)
             phrases += part
             dropped += part_dropped
+            used[result.service] += 1
+            spent += result.cost_usd
             took = time.monotonic() - began
             chunk_reports.append({"chunk": chunk.path.name, "start": chunk.start, "seconds": round(chunk.duration, 1),
-                                  "took": round(took, 1), "phrases": len(part), "dropped": dict(part_dropped)})
-            print(f"Кусок {number}/{len(chunks)}: {chunk.duration / 60:.0f} мин за {took:.1f} с, фраз {len(part)}, "
-                  f"отброшено {sum(part_dropped.values())}")
+                                  "service": result.service, "took": round(took, 1), "phrases": len(part),
+                                  "dropped": dict(part_dropped)})
+            print(f"Кусок {number}/{len(chunks)} ({result.service}): {chunk.duration / 60:.0f} мин за {took:.1f} с, "
+                  f"фраз {len(part)}, отброшено {sum(part_dropped.values())}")
 
     phrases.sort(key=lambda phrase: phrase.start)
     (out / "transcript.json").write_text(transcript.dump(phrases))
     (out / "transcript.txt").write_text(transcript.render(phrases))
     report = {
-        "vod": args.vod_id, "model": args.model, "language": args.language, "start_minute": args.start,
+        "vod": args.vod_id, "services": dict(used), "problems": recognizer.broken, "language": args.language,
+        "start_minute": args.start,
         "audio_minutes": round(sum(c.duration for c in chunks) / 60, 1), "audio_mb": round(size_mb, 1),
         "extract_seconds": round(extracted), "total_seconds": round(time.monotonic() - started),
-        "cost_usd": round(groq.cost([c.duration for c in chunks], args.model), 4),
+        "cost_usd": round(spent, 4),
         "phrases": len(phrases), "words": sum(len(p.text.split()) for p in phrases), "dropped": dict(dropped),
         "chunks": chunk_reports,
     }
@@ -105,6 +116,8 @@ async def run_transcribe(args: argparse.Namespace) -> int:
 
     print(f"\nГотово за {report['total_seconds']} с: {report['phrases']} фраз, {report['words']} слов, "
           f"цена ≈ ${report['cost_usd']:.3f}. Отброшено: {dict(dropped) or 'ничего'}")
+    for problem in recognizer.broken.values():
+        print(f"Внимание: {problem}")
     print(f"Файлы: {out}")
     return 0
 
@@ -132,7 +145,7 @@ async def run_analyze(args: argparse.Namespace) -> int:
 
     name = args.name or info.uploader
     chapters = segments.normalize_chapters(info.chapters, info.duration)
-    planned = segments.plan_segments(chapters, min_sec=MIN_SEGMENT_SEC, join=True)
+    planned = segments.plan_segments(chapters, min_sec=MIN_SEGMENT_SEC, join=not args.no_join)
     context = timeline.Context(name, info.title, [(c.start, c.end, c.title) for c in chapters])
     ask = functools.partial(claude.ask_json, claude.make_client(key), model=args.model)
     print(f"Запись {vod_id}: «{info.title}», {info.duration / 3600:.1f} ч, сегментов по главам Twitch: {len(planned)}; "
@@ -166,9 +179,8 @@ async def run_analyze(args: argparse.Namespace) -> int:
                         usage.add(used)
                         moments += found
                         transcribed += piece[-1].end - piece[0].start
-                    middle, reason, used = await titles.suggest(
-                        ask, streamer=name, stream_title=stream_title, category=seg.category, moments=moments,
-                        effort=args.effort,
+                    parts, topics, used = await video_chapters.suggest(
+                        ask, category=seg.category, moments=moments, spans=seg.spans, effort=args.effort
                     )
                     usage.add(used)
                 except claude.ClaudeError as exc:
@@ -178,9 +190,10 @@ async def run_analyze(args: argparse.Namespace) -> int:
                     break
                 row.update(
                     moments=[asdict(m) for m in moments],
+                    chapters=[asdict(c) for c in parts],
                     coverage=round(timeline.coverage(moments, 0, transcribed), 2),
-                    middle=middle, middle_rejected=reason,
-                    title=titles.compose(seg.category, middle, stream_title, name),
+                    topics=titles.pick_topics(topics, (seg.category, name)),
+                    title=titles.compose(topics, stream_title, seg.category, name),
                     title_now=segments.build_title(seg.category, stream_title, name),
                 )
         print(label, f"({row['minutes']} мин)")
@@ -189,13 +202,18 @@ async def run_analyze(args: argparse.Namespace) -> int:
             continue
         print(timeline.render([timeline.Moment(**m) for m in row["moments"]]))
         print(f"  покрытие моментами: {row['coverage']:.0%}")
+        if row["chapters"]:
+            print("  главы для описания:")
+            print(textwrap.indent(video_chapters.render([video_chapters.VideoChapter(**c) for c in row["chapters"]]), "    "))
+        else:
+            print("  глав нет: YouTube показывает их, только когда их не меньше трёх")
         print(f"  название сейчас: {row['title_now']}")
-        print(f"  название от Haiku: {row['title']}" + (f"  (не взято: {row['middle_rejected']})" if row["middle_rejected"] else "") + "\n")
+        print(f"  название от Haiku: {row['title']}" + ("" if row["topics"] else "  (тем нет: взято название стрима)") + "\n")
 
     (folder / "analysis.json").write_text(json.dumps({"vod": vod_id, "model": args.model, "effort": args.effort,
                                                       "usage": asdict(usage), "segments": rows}, ensure_ascii=False, indent=2))
-    print(f"Расход: запросов {usage.requests}, токенов {usage.input_tokens} на входе и {usage.output_tokens} на выходе, "
-          f"цена ≈ ${usage.cost_usd:.4f}. Файл: {folder / 'analysis.json'}")
+    print(f"Расход: запросов {usage.requests}, токенов {usage.input_tokens} на входе и {usage.output_tokens} на выходе "
+          f"(из них размышления {usage.thinking_tokens}), цена ≈ ${usage.cost_usd:.4f}. Файл: {folder / 'analysis.json'}")
     if failure:
         print("Разбор остановлен:", failure)
         return 1
@@ -205,12 +223,12 @@ async def run_analyze(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.ai", description=__doc__.split("\n\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
-    cmd = commands.add_parser("transcribe", help="расшифровать звук записи Twitch через Groq")
+    cmd = commands.add_parser("transcribe", help="расшифровать звук записи Twitch (OpenRouter, запасной — Groq)")
     cmd.add_argument("vod_id", help="ID записи, например 2927594240")
     cmd.add_argument("--minutes", type=int, default=0, help="взять только N минут (для пробы); 0 — до конца записи")
     cmd.add_argument("--start", type=int, default=0, help="с какой минуты записи начать")
     cmd.add_argument("--chunk", type=int, default=audio.CHUNK_SEC // 60, help="длина куска в минутах")
-    cmd.add_argument("--model", default=groq.MODEL)
+    cmd.add_argument("--service", default="auto", choices=("auto", *SERVICES), help="каким сервисом расшифровывать")
     cmd.add_argument("--language", default="ru")
     cmd.add_argument("--out", default=os.environ.get("AI_LAB_DIR", "/data/ai-lab"))
     cmd.add_argument("--keep-audio", action="store_true", help="не удалять куски звука после расшифровки")
@@ -218,6 +236,7 @@ def main(argv: list[str] | None = None) -> int:
     ana.add_argument("vod_id", help="ID записи: расшифровка должна лежать в папке --out")
     ana.add_argument("--name", default="", help="имя стримера в названиях (по умолчанию — название канала на Twitch)")
     ana.add_argument("--window", type=int, default=60, help="длина окна для одного запроса, минут")
+    ana.add_argument("--no-join", action="store_true", help="не склеивать куски одной категории в один ролик")
     ana.add_argument("--effort", default="low", choices=("low", "medium", "high"), help="глубина размышлений модели")
     ana.add_argument("--model", default=claude.MODEL)
     ana.add_argument("--out", default=os.environ.get("AI_LAB_DIR", "/data/ai-lab"))

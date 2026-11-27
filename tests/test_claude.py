@@ -52,6 +52,13 @@ class AskJsonTest(unittest.TestCase):
         _, usage = ask(FakeClient(reply(input_tokens=10_000, output_tokens=1_000)))
         self.assertEqual((usage.requests, usage.input_tokens, usage.output_tokens), (1, 10_000, 1_000))
         self.assertAlmostEqual(usage.cost_usd, (10_000 * 0.10 + 1_000 * 0.50) / 1e6)
+        self.assertEqual(usage.thinking_tokens, 0)
+        details = SimpleNamespace(thinking_tokens=700)
+        _, usage = ask(FakeClient(reply(input_tokens=10, output_tokens=1_000, output_tokens_details=details)))
+        total = claude.Usage()
+        total.add(usage)
+        total.add(usage)
+        self.assertEqual(total.thinking_tokens, 1400)
         _, usage = ask(FakeClient(reply(input_tokens=200_000, output_tokens=1_000)))
         self.assertAlmostEqual(usage.cost_usd, (200_000 * 0.50 + 1_000 * 2.50) / 1e6)
 

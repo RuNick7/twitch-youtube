@@ -1,12 +1,6 @@
-import asyncio
 import unittest
 
-from app.ai import claude, titles
-from app.ai.timeline import Moment
-
-
-def moment(start, end, topic="тема", kind="talk"):
-    return Moment(start, end, kind, topic, "high")
+from app.ai import titles
 
 
 class ProfanityTest(unittest.TestCase):
@@ -20,87 +14,72 @@ class ProfanityTest(unittest.TestCase):
             self.assertFalse(titles.has_profanity(text), text)
 
 
-class ParseTitleTest(unittest.TestCase):
-    def test_good_title(self):
-        self.assertEqual(titles.parse_title({"title": "  Строим замок и обсуждаем новости. "}), ("Строим замок и обсуждаем новости", None))
+class PickTopicsTest(unittest.TestCase):
+    def test_clean_short_topics_in_the_given_order(self):
+        self.assertEqual(titles.pick_topics([" СДЭК. ", "перенос  серверов", "экзамен на права"]),
+                         ["СДЭК", "перенос серверов", "экзамен на права"])
 
-    def test_empty_short_and_profane_are_rejected(self):
-        self.assertEqual(titles.parse_title({"title": ""}), (None, "модель не нашла конкретики"))
-        self.assertEqual(titles.parse_title({}), (None, "модель не нашла конкретики"))
-        self.assertEqual(titles.parse_title({"title": "Игра"}), (None, "слишком короткое название"))
-        self.assertEqual(titles.parse_title({"title": "Блять, опять сломал сервер"}), (None, "в названии мат"))
+    def test_long_profane_empty_and_repeated_are_dropped(self):
+        raw = ["", "  ", None, 5, "очень длинная тема из многих слов", "а" * 31, "Блять", "Ёлка", "елка!", "ковка"]
+        self.assertEqual(titles.pick_topics(raw), ["Ёлка", "ковка"])
+        self.assertEqual(titles.pick_topics(None), [])
 
-    def test_separator_and_brackets_cannot_break_the_template(self):
-        middle, _ = titles.parse_title({"title": "Dota 2 | турнир <b>финал</b>"})
-        self.assertNotIn("|", middle)
-        self.assertNotIn("<", middle)
+    def test_category_and_streamer_are_not_topics(self):
+        self.assertEqual(titles.pick_topics(["Minecraft", "заквиель", "Just  Chatting", "шахта"],
+                                            ("Minecraft", "Заквиель", "Just Chatting")), ["шахта"])
 
-    def test_cut_never_splits_a_word_or_leaves_a_dangling_preposition(self):
-        middle, _ = titles.parse_title({"title": "Сюжетные миссии GTA V: перестрелка, похищение и разборки с бандой"})
-        self.assertEqual(middle, "Сюжетные миссии GTA V: перестрелка, похищение и разборки")
-        self.assertEqual(titles._cut_words("а" * 80, 60), "а" * 60)  # одно длинное слово режется как есть
+    def test_separators_inside_a_topic_cannot_break_the_title(self):
+        [topic] = titles.pick_topics(["бой | <b>босс</b>,"])
+        for symbol in "|,<>":
+            self.assertNotIn(symbol, topic)
 
-    def test_long_title_is_cut(self):
-        middle, _ = titles.parse_title({"title": "слово " * 40})
-        self.assertLessEqual(len(middle), titles.MIDDLE_MAX_CHARS)
-        self.assertFalse(middle.endswith(" "))
+    def test_no_more_than_five(self):
+        self.assertEqual(titles.pick_topics([f"тема {i}" for i in range(8)]), [f"тема {i}" for i in range(5)])
 
 
 class ComposeTest(unittest.TestCase):
-    def test_with_and_without_model_middle(self):
-        self.assertEqual(titles.compose("Minecraft", "Строим замок", "Стрим про Minecraft", "Заквиель", 12),
-                         "Minecraft | Строим замок | Часть 12 | Заквиель")
-        self.assertEqual(titles.compose("Minecraft", None, "Стрим про Minecraft", "Заквиель"),
-                         "Minecraft | Стрим про Minecraft | Заквиель")
+    def test_topics_then_category_then_streamer(self):
+        self.assertEqual(titles.compose(["шахта", "боты", "розыгрыш"], "Большой стрим", "Minecraft", "Заквиель"),
+                         "Шахта, боты, розыгрыш | Minecraft | Заквиель")
 
-    def test_never_longer_than_youtube_allows(self):
-        title = titles.compose("Minecraft", "я" * 60, "х" * 300, "Заквиель", 12)
+    def test_stream_title_when_there_are_no_topics(self):
+        self.assertEqual(titles.compose([], "Большой  стрим", "Minecraft", "Заквиель"), "Большой стрим | Minecraft | Заквиель")
+        self.assertEqual(titles.compose(["Minecraft"], "Большой стрим", "Minecraft", "Заквиель"),
+                         "Большой стрим | Minecraft | Заквиель")
+        self.assertEqual(titles.compose([], "", "", "Заквиель"), "Стрим | Заквиель")
+
+    def test_a_topic_is_never_cut_in_the_middle(self):
+        topics = ["ремонт старой квартиры", "покупка нового телефона", "восстановление старой крепости", "сыр"]
+        title = titles.compose(topics, "Стрим", "Minecraft", "Заквиель")
+        head = title.split(" | ")[0]
+        self.assertEqual(head, "Ремонт старой квартиры, покупка нового телефона, сыр")
+        self.assertLessEqual(len(head), titles.HEADLINE_MAX_CHARS)
+
+    def test_headline_stays_within_what_youtube_shows(self):
+        topics = ["ремонт старой квартиры", "покупка нового телефона", "осада большого замка", "сыр"]
+        head = titles.compose(topics, "Стрим", "Minecraft", "Заквиель").split(" | ")[0]
+        self.assertEqual(head, "Ремонт старой квартиры, покупка нового телефона, осада большого замка")
+
+    def test_long_category_leaves_less_room(self):
+        category = "К" * 60
+        title = titles.compose(["покупка телефона", "осада замка", "сыр"], "Стрим", category, "Заквиель")
         self.assertLessEqual(len(title), 100)
-        self.assertTrue(title.endswith("Часть 12 | Заквиель"))
+        self.assertEqual(title, f"Покупка телефона, сыр | {category} | Заквиель")
 
+    def test_only_stream_title_is_cut_to_what_youtube_allows(self):
+        title = titles.compose([], "очень длинное название " * 20, "The Witcher 3: Wild Hunt", "Заквиель")
+        self.assertLessEqual(len(title), 100)
+        self.assertTrue(title.endswith(" | The Witcher 3: Wild Hunt | Заквиель"), title)
+        self.assertTrue(title.startswith("очень длинное название"))
 
-class PromptTest(unittest.TestCase):
-    def test_shows_forty_longest_moments_in_time_order(self):
-        moments = [moment(i * 600, i * 600 + 600 + i, f"тема {i}") for i in range(60)]
-        prompt = titles.build_user_prompt("Заквиель", "Стрим", "Just Chatting", moments)
-        lines = [line for line in prompt.splitlines() if " talk: тема " in line]
-        self.assertEqual(len(lines), titles.MAX_MOMENTS)
-        self.assertIn("тема 59", prompt)
-        self.assertNotIn("тема 0\n", prompt + "\n")
-        numbers = [int(line.rsplit("тема ", 1)[1]) for line in lines]
-        self.assertEqual(numbers, sorted(numbers))
-        self.assertIn("Категория Twitch: Just Chatting", prompt)
-        self.assertIn("Название стрима на Twitch: Стрим", prompt)
+    def test_huge_category_leaves_no_room_for_topics(self):
+        title = titles.compose(["замок"], "Стрим", "К" * 95, "Заквиель")
+        self.assertEqual((len(title), title[:3]), (100, "ККК"))
 
-    def test_prompt_forbids_profanity_and_fabrication(self):
-        self.assertIn("без мата", titles.SYSTEM)
-        self.assertIn("ничего не выдумывай", titles.SYSTEM)
-
-
-class SuggestTest(unittest.TestCase):
-    def run_suggest(self, answer, moments):
-        calls = []
-
-        async def ask(**kw):
-            calls.append(kw)
-            return answer, claude.Usage(1, 500, 50, 0.0001)
-
-        result = asyncio.run(titles.suggest(ask, streamer="Заквиель", stream_title="Стрим", category="Minecraft",
-                                            moments=moments, effort="medium"))
-        return result, calls
-
-    def test_good_answer(self):
-        (middle, reason, usage), calls = self.run_suggest({"title": "Строим замок на закате"}, [moment(0, 3600, "строят замок")])
-        self.assertEqual((middle, reason, usage.requests), ("Строим замок на закате", None, 1))
-        self.assertEqual((calls[0]["effort"], calls[0]["schema"], calls[0]["max_tokens"]), ("medium", titles.SCHEMA, titles.MAX_TOKENS))
-
-    def test_no_moments_no_request(self):
-        (middle, reason, usage), calls = self.run_suggest({"title": "что-то"}, [])
-        self.assertEqual((middle, reason, usage.requests, calls), (None, "нет моментов", 0, []))
-
-    def test_rejected_answer_keeps_reason(self):
-        (middle, reason, _), _ = self.run_suggest({"title": ""}, [moment(0, 600)])
-        self.assertEqual((middle, reason), (None, "модель не нашла конкретики"))
+    def test_cut_never_splits_a_word_or_leaves_a_dangling_preposition(self):
+        self.assertEqual(titles.cut_words("Сюжетные миссии GTA V: перестрелка, похищение и разборки с бандой", 60),
+                         "Сюжетные миссии GTA V: перестрелка, похищение и разборки")
+        self.assertEqual(titles.cut_words("а" * 80, 60), "а" * 60)  # одно длинное слово режется как есть
 
 
 if __name__ == "__main__":

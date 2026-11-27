@@ -34,12 +34,14 @@ class Usage:
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
+    thinking_tokens: int = 0  # входят в output_tokens и оплачиваются так же
 
     def add(self, other: "Usage") -> None:
         self.requests += other.requests
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
         self.cost_usd += other.cost_usd
+        self.thinking_tokens += other.thinking_tokens
 
 
 def request_cost(input_tokens: int, output_tokens: int, model: str = MODEL) -> float:
@@ -121,4 +123,5 @@ async def ask_json(
         + (getattr(usage, "cache_read_input_tokens", 0) or 0)
         + (getattr(usage, "cache_creation_input_tokens", 0) or 0)
     )
-    return data, Usage(1, prompt, usage.output_tokens, request_cost(prompt, usage.output_tokens, model))
+    thinking = getattr(getattr(usage, "output_tokens_details", None), "thinking_tokens", 0) or 0
+    return data, Usage(1, prompt, usage.output_tokens, request_cost(prompt, usage.output_tokens, model), thinking)

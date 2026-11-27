@@ -19,6 +19,8 @@ class PromptTest(unittest.TestCase):
         self.assertIn("стоит на паузе и стример несколько минут говорит о другом, это talk", timeline.SYSTEM)
         self.assertNotIn("это talk или game", timeline.SYSTEM)  # с этой фразой сцена фильма становилась «игрой»
         self.assertIn("в категории Just Chatting «game» ставь, только когда ясно, что играет сам стример", timeline.SYSTEM)
+        self.assertIn("разные темы в один момент не объединяй", timeline.SYSTEM)
+        self.assertNotIn("короче 2 минут", timeline.SYSTEM)
 
 
 class ParseTimeTest(unittest.TestCase):
@@ -76,12 +78,26 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(len(timeline.merge_same([moment(0, 600, "game", "а"), moment(600, 1200, "talk", "а")])), 2)
 
     def test_short_moment_joins_previous_or_next(self):
-        merged = timeline.merge_short([moment(0, 60, "talk", "а"), moment(60, 900, "game", "б"), moment(900, 960, "talk", "в"),
-                                       moment(960, 1800, "video", "г")])
-        self.assertEqual([(m.start, m.end, m.kind) for m in merged], [(0, 960, "game"), (960, 1800, "video")])
+        merged = timeline.merge_short([moment(0, 20, "talk", "а"), moment(20, 900, "game", "б"), moment(900, 920, "talk", "в"),
+                                       moment(920, 1800, "video", "г")])
+        self.assertEqual([(m.start, m.end, m.kind) for m in merged], [(0, 920, "game"), (920, 1800, "video")])
 
-    def test_only_short_moments_are_all_dropped(self):
-        self.assertEqual(timeline.merge_short([moment(0, 60), moment(60, 100)]), [])
+    def test_topic_of_a_minute_stays_on_its_own(self):
+        rows = [moment(0, 300, "talk", "доставка"), moment(300, 340, "talk", "воскрешение"), moment(340, 380, "talk", "заточка")]
+        self.assertEqual([m.topic for m in timeline.merge_short(rows)], ["доставка", "воскрешение", "заточка"])
+
+    def test_chain_of_scraps_becomes_its_own_moment_with_the_longest_topic(self):
+        merged = timeline.merge_short([moment(0, 300, "talk", "доставка"), moment(300, 312, "talk", "а"),
+                                       moment(312, 337, "game", "баланс"), moment(337, 900, "talk", "экзамен")])
+        self.assertEqual([(m.start, m.end, m.kind, m.topic) for m in merged],
+                         [(0, 300, "talk", "доставка"), (300, 337, "game", "баланс"), (337, 900, "talk", "экзамен")])
+
+    def test_scraps_at_the_end_join_the_previous_moment(self):
+        merged = timeline.merge_short([moment(0, 300, "talk", "а"), moment(300, 320, "talk", "б")])
+        self.assertEqual([(m.start, m.end, m.topic) for m in merged], [(0, 320, "а")])
+
+    def test_nothing_but_a_scrap_is_dropped(self):
+        self.assertEqual(timeline.merge_short([moment(0, 20)]), [])
 
     def test_combine_windows_without_repeating_overlap(self):
         first = [moment(0, 1800, "talk", "а"), moment(1800, 3600, "game", "б")]
@@ -115,6 +131,12 @@ class BridgeVideoTest(unittest.TestCase):
         self.assertEqual(self.kinds((0, 600, "video"), (600, 840, "talk"), (840, 1500, "video")), ["video", "talk", "video"])
         self.assertEqual(self.kinds((0, 600, "video"), (600, 700, "break"), (700, 840, "talk"), (840, 1500, "video")),
                          ["video", "break", "talk", "video"])
+
+    def test_short_remarks_inside_a_film_become_video_but_gameplay_does_not(self):
+        self.assertEqual(self.kinds((0, 600, "video"), (600, 660, "talk"), (660, 700, "break"), (700, 1300, "video")), ["video"] * 4)
+        self.assertEqual(self.kinds((0, 600, "video"), (600, 780, "talk"), (780, 1300, "video")), ["video"] * 3)
+        self.assertEqual(self.kinds((0, 600, "video"), (600, 660, "game"), (660, 1300, "video")), ["video", "game", "video"])
+        self.assertEqual(self.kinds((0, 600, "video"), (600, 660, "talk")), ["video", "talk"])
 
     def test_long_gap_and_edges_are_left_alone(self):
         self.assertEqual(self.kinds((0, 600, "video"), (600, 1300, "break"), (1300, 2000, "video")), ["video", "break", "video"])

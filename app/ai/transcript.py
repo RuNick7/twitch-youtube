@@ -22,6 +22,9 @@ _CREDITS = re.compile(
 # Эти фразы бывают и настоящими, поэтому отбрасываются, только если Whisper сомневался, что в звуке была речь
 _FILLERS = re.compile(r"^(?:спасибо за просмотр|подписывайтесь на (?:наш )?канал)\W*$", re.I)
 FILLER_NO_SPEECH_ABOVE = 0.3
+# Короткое «Спасибо» Whisper выдумывает на музыке, но так же благодарят за донаты: настоящее он слышит увереннее
+_THANKS = re.compile(r"^\W*спасибо\W*$", re.I)
+THANKS_LOGPROB_BELOW = -0.45
 
 
 @dataclass(frozen=True)
@@ -63,7 +66,7 @@ def parse_verbose(data: dict, offset: float = 0.0) -> tuple[list[Phrase], Counte
         no_speech = float(item.get("no_speech_prob") or 0)
         logprob = float(item.get("avg_logprob") or 0)
         ratio = float(item.get("compression_ratio") or 0)
-        if not text:
+        if not re.search(r"\w", text):
             dropped["пусто"] += 1
         elif no_speech > NO_SPEECH_ABOVE and logprob < LOGPROB_BELOW:
             dropped["тишина или музыка"] += 1
@@ -71,7 +74,9 @@ def parse_verbose(data: dict, offset: float = 0.0) -> tuple[list[Phrase], Counte
             dropped["зацикливание"] += 1
         elif _CREDITS.search(text):
             dropped["чужие субтитры"] += 1
-        elif _FILLERS.match(text) and no_speech > FILLER_NO_SPEECH_ABOVE:
+        elif (_FILLERS.match(text) and no_speech > FILLER_NO_SPEECH_ABOVE) or (
+            _THANKS.match(text) and logprob < THANKS_LOGPROB_BELOW
+        ):
             dropped["фраза из тишины"] += 1
         else:
             start = float(item.get("start") or 0)

@@ -18,14 +18,17 @@ log = logging.getLogger(__name__)
 
 KINDS = ("game", "talk", "video", "break", "other")
 CONFIDENCE = ("high", "medium", "low")
-MIN_MOMENT_SEC = 120  # короче — приклеивается к соседнему
+MIN_MOMENT_SEC = 30  # обрывки короче приклеиваются к соседнему; крупные темы собирают уже главы
 TOPIC_MAX_CHARS = 120
-MAX_TOKENS = 8000
+MAX_TOKENS = 16000  # за час набирается полсотни моментов, и размышления тоже входят в лимит
 MIN_COVERAGE = 0.8  # моменты должны покрывать окно хотя бы настолько, иначе запрос повторяется
 ATTEMPTS = 2
 # «Перерыв» или «другое» не длиннее этого между двумя кусками видео — тоже видео: Twitch глушит музыку фильма,
-# в тексте остаётся дыра. Разговор так не склеивается: пока видео на паузе, кусок можно оставить в ролике
+# в тексте остаётся дыра
 VIDEO_GAP_SEC = 600
+# Короткий разговор между кусками видео — тоже видео: стример комментирует идущий фильм. Долгий разговор так не
+# склеивается: пока видео на паузе, кусок можно оставить в ролике
+VIDEO_TALK_GAP_SEC = 180
 
 SYSTEM = """Ты размечаешь по времени расшифровку записи стрима на Twitch: что происходит в каждый отрезок.
 
@@ -38,7 +41,7 @@ SYSTEM = """Ты размечаешь по времени расшифровку
 - confidence: «high», «medium» или «low».
 
 Правила:
-- новый момент начинается, когда меняется занятие или тема разговора; отрезки короче 2 минут не выделяй, присоединяй к соседним;
+- новый момент начинается, когда меняется занятие или тема разговора: разные темы в один момент не объединяй, даже если тема заняла около минуты; реплики короче 30 секунд присоединяй к соседним;
 - если категория Twitch — игра, речь персонажей и кат-сцены игры — это game, а не video; video ставь, только когда по тексту ясно, что стример смотрит постороннее видео;
 - в категории Just Chatting «game» ставь, только когда ясно, что играет сам стример: стрельба, взрывы и опасности в диалогах фильма — это video;
 - озвучка донатов (синтезированный голос читает сообщение зрителя, часто с суммой) — часть текущего занятия, не video;
@@ -166,20 +169,29 @@ def merge_same(moments: Sequence[Moment]) -> list[Moment]:
 
 
 def merge_short(moments: Sequence[Moment], min_sec: float = MIN_MOMENT_SEC) -> list[Moment]:
-    """Момент короче min_sec приклеивается к предыдущему, а в начале — к следующему."""
+    """Обрывки короче min_sec приклеиваются к предыдущему моменту, а в начале — к следующему.
+
+    Несколько обрывков подряд, которые вместе набирают min_sec, — отдельный момент с темой самого длинного из них:
+    иначе предыдущий растянулся бы на них, а их темы пропали бы.
+    """
     result: list[Moment] = []
-    pending_start: float | None = None
+    short: list[Moment] = []
     for moment in moments:
-        if pending_start is not None:
-            moment = replace(moment, start=pending_start)
-            pending_start = None
         if moment.duration < min_sec:
-            if result:
-                result[-1] = replace(result[-1], end=moment.end)
-            else:
-                pending_start = moment.start
+            short.append(moment)
+            if short[-1].end - short[0].start >= min_sec:
+                result.append(replace(max(short, key=lambda m: m.duration), start=short[0].start, end=short[-1].end))
+                short = []
             continue
+        if short:
+            if result:
+                result[-1] = replace(result[-1], end=short[-1].end)
+            else:
+                moment = replace(moment, start=short[0].start)
+            short = []
         result.append(moment)
+    if short and result:
+        result[-1] = replace(result[-1], end=short[-1].end)
     return result
 
 
@@ -196,17 +208,23 @@ def combine(parts: Sequence[Sequence[Moment]], min_sec: float = MIN_MOMENT_SEC) 
     return merge_short(merge_same(result), min_sec)
 
 
-def bridge_video(moments: Sequence[Moment], max_gap: float = VIDEO_GAP_SEC) -> list[Moment]:
-    """Дыры без речи внутри просмотра видео помечаются как видео (с низкой уверенностью)."""
+def bridge_video(
+    moments: Sequence[Moment], max_gap: float = VIDEO_GAP_SEC, talk_gap: float = VIDEO_TALK_GAP_SEC
+) -> list[Moment]:
+    """Дыры без речи и короткие реплики внутри просмотра видео помечаются как видео (с низкой уверенностью).
+
+    Игра между кусками видео остаётся игрой.
+    """
     result = list(moments)
     previous_video = None
     for i, moment in enumerate(result):
         if moment.kind == "video":
             if previous_video is not None:
                 between = result[previous_video + 1 : i]
-                if between and all(m.kind in ("break", "other") for m in between) and (
-                    moment.start - result[previous_video].end <= max_gap
-                ):
+                gap = moment.start - result[previous_video].end
+                silence = all(m.kind in ("break", "other") for m in between) and gap <= max_gap
+                remarks = all(m.kind in ("talk", "break", "other") for m in between) and gap <= talk_gap
+                if between and (silence or remarks):
                     result[previous_video + 1 : i] = [replace(m, kind="video", confidence="low") for m in between]
             previous_video = i
     return result

@@ -55,6 +55,19 @@ class ParseVerboseTest(unittest.TestCase):
         self.assertEqual([p.text for p in phrases], ["Там в конце написано, что продолжение следует, и всё"])
         self.assertEqual(dropped["чужие субтитры"], 1)
 
+    def test_unsure_thank_you_is_dropped_but_a_clear_one_stays(self):
+        phrases, dropped = self.parse(
+            seg("Спасибо.", logprob=-0.7),  # так Whisper «слышит» музыку
+            seg(" спасибо! ", logprob=-0.3),
+            seg("Спасибо за донат, дружище", logprob=-0.8),
+        )
+        self.assertEqual([p.text for p in phrases], ["спасибо!", "Спасибо за донат, дружище"])
+        self.assertEqual(dropped["фраза из тишины"], 1)
+
+    def test_punctuation_only_is_empty(self):
+        phrases, dropped = self.parse(seg("..."), seg(" — "), seg("да"))
+        self.assertEqual(([p.text for p in phrases], dropped["пусто"]), (["да"], 2))
+
     def test_end_never_before_start(self):
         phrases, _ = self.parse(seg("странно", 10.0, 9.0))
         self.assertEqual((phrases[0].start, phrases[0].end), (10.0, 10.0))

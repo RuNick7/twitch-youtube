@@ -25,7 +25,7 @@ class TranscribeFileTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "chunk-000.flac"
         self.path.write_bytes(b"fLaC-audio")
-        sleep = mock.patch("app.ai.groq.asyncio.sleep", new=mock.AsyncMock())
+        sleep = mock.patch("app.ai.speech.asyncio.sleep", new=mock.AsyncMock())
         self.sleep = sleep.start()
         self.addCleanup(sleep.stop)
 
