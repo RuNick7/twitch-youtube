@@ -357,8 +357,10 @@ def video_metadata(settings: Settings, snippet: dict) -> dict:
     }
 
 
-async def publish(app: App, segment_id: int) -> str:
+async def publish(app: App, segment_id: int, notes: list[str] | None = None) -> str:
     """Открывает доступ к ролику и возвращает короткий итог.
+
+    notes — ограничения YouTube, с которыми ролик разрешено публиковать самому: они записываются и называются.
 
     Ошибки YouTube (в том числе AuthError) пробрасываются вызывающему.
     """
@@ -400,11 +402,14 @@ async def publish(app: App, segment_id: int) -> str:
             published_at=now,
             monitor_until=now + timedelta(days=settings.monitor_days),
             check_at=now + MONITOR_EVERY,
+            **({"warnings": dump_warnings(notes)} if notes else {}),
         )
         app.sync_wake.set()  # в плейлист категории
         await app.refresh_segment(seg.id)
+        limits = "".join(f"\n• {escape(note)}" for note in notes or ())
         await app.notify(
-            f"✅ Опубликовано: «{escape(seg.title)}» {youtube_link(seg.youtube_id)}",
+            f"✅ Опубликовано: «{escape(seg.title)}» {youtube_link(seg.youtube_id)}"
+            + (f"\nС ограничениями YouTube:{limits}" if limits else ""),
             reply_to=seg.tg_message_id,
             silent=True,
         )

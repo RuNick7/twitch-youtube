@@ -121,9 +121,15 @@ def render_consent(settings: Settings, streamer_name: str, changes: list[str] | 
     """
     privacy = PRIVACY_NAMES[settings.publish_privacy]
     if settings.auto_publish:
+        tolerated = []
+        if settings.auto_publish_age_restricted:
+            tolerated.append("ограничение 18+")
+        if settings.auto_publish_max_blocked:
+            tolerated.append(f"блокировка не больше чем в {settings.auto_publish_max_blocked} странах")
+        extra = f" ({' и '.join(tolerated)} публикации не мешают)" if tolerated else ""
         publishing = (
             f"делать ролик {privacy} через {settings.publish_delay_min} мин после обработки, если YouTube "
-            "не выдал предупреждений, а ролик с предупреждениями — только по вашей кнопке"
+            f"не выдал предупреждений{extra}, а ролик с предупреждениями — только по вашей кнопке"
         )
     else:
         publishing = f"делать ролик {privacy} только по вашей кнопке «Опубликовать»"

@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     # Публикация: ролик без предупреждений становится публичным через publish_delay_min
     # после того, как YouTube его обработал (время на проверку Content ID)
     auto_publish: bool = True
+    # Что не мешает автопубликации: ограничение 18+ и блокировка не больше чем в стольких странах (0 — любая
+    # блокировка ждёт решения). Действует, когда владелец канала принял политику, где это описано
+    auto_publish_age_restricted: bool = True
+    auto_publish_max_blocked: int = 10
     publish_privacy: Literal["public", "unlisted"] = "public"
     publish_delay_min: int = 60
     # Сколько дней после публикации следить, не заблокировал ли YouTube ролик
@@ -121,6 +125,8 @@ class Settings(BaseSettings):
 # Настройки, которые можно задать стримеру отдельно (Streamer.overrides). Остальные общие для всех стримеров
 STREAMER_FIELDS = (
     "auto_publish",
+    "auto_publish_age_restricted",
+    "auto_publish_max_blocked",
     "publish_privacy",
     "publish_delay_min",
     "monitor_days",

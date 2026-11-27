@@ -130,8 +130,9 @@ Shorts хранятся в той же таблице, что сегменты, 
 | Название стрима не получается узнать 10 минут подряд | GraphQL Twitch | 🟡, режет только по категориям |
 | Рискованная категория (казино, покер) | `WARN_CATEGORIES` | ⚠️ решение |
 | Сегмент загружен вручную вопреки фильтру | кнопка «Всё равно загрузить» | ⚠️ решение |
-| Заблокирован целиком или в части стран | `contentDetails.regionRestriction` | ⚠️ решение |
-| Возрастное ограничение | `contentDetails.contentRating.ytRating` | ⚠️ решение |
+| Заблокирован целиком или больше чем в 10 странах | `contentDetails.regionRestriction` | ⚠️ решение |
+| Заблокирован не больше чем в 10 странах | `contentDetails.regionRestriction` | публикуется сам, страны названы в сообщении |
+| Возрастное ограничение | `contentDetails.contentRating.ytRating` | публикуется сам, ограничение названо в сообщении |
 | Длительность на YouTube не совпала с ожидаемой | `contentDetails.duration` | ⚠️ решение |
 | Отклонён (claim, copyright, duplicate…) или не обработан | `status.uploadStatus`, `rejectionReason`, `failureReason` | 🔴, публиковать нечего |
 | YouTube оставил ролик приватным при публикации | ответ `videos.update` | 🔒, скорее всего не пройден аудит API |

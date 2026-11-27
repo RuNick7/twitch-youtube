@@ -60,6 +60,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker  # noqa: E402
 from app.db import (  # noqa: E402
     KV, SHORT, Playlist, Segment, Status, Streamer, TitleChange, Vod, as_utc, clips_vod_id, make_engine,
 )
+from app.consent import CONSENT_VERSION  # noqa: E402
 from app.tools import ToolError, VodInfo  # noqa: E402
 from app.twitch import LiveState, TwitchError  # noqa: E402
 
@@ -239,7 +240,8 @@ def make_old_database(path: Path) -> None:
     con.execute("INSERT INTO streamers (login, display_name) VALUES (?, ?)", ("old_test_channel", "OldTest"))
     con.executemany(
         "INSERT INTO kv VALUES (?, ?)",
-        [("watch_since", OLD_SINCE.isoformat()), ("consent_version", "3"), ("consent_prompted", "3"), ("paused", "0")],
+        [("watch_since", OLD_SINCE.isoformat()), ("consent_version", str(CONSENT_VERSION)),
+         ("consent_prompted", str(CONSENT_VERSION)), ("paused", "0")],
     )
     con.commit()
     con.close()
@@ -379,8 +381,8 @@ async def main():
     print("\n== 0. Обновление с версии, где стример был один", flush=True)
     task = await start_app()
     alpha, old = await streamer("alpha_channel"), await streamer("old_test_channel")
-    check(alpha.watch_since and as_utc(alpha.watch_since) == OLD_SINCE and alpha.consent_version == 3
-          and alpha.consent_prompted == 3 and alpha.paused is False and alpha.removed_at is None,
+    check(alpha.watch_since and as_utc(alpha.watch_since) == OLD_SINCE and alpha.consent_version == CONSENT_VERSION
+          and alpha.consent_prompted == CONSENT_VERSION and alpha.paused is False and alpha.removed_at is None,
           "пауза, начало слежения и согласие перенесены из общих ключей в запись стримера",
           (alpha.watch_since, alpha.consent_version, alpha.consent_prompted, alpha.paused))
     check(alpha.title_name == "Альфа", "имя для названий взято из STREAMER_NAME", alpha.title_name)
@@ -492,7 +494,7 @@ async def main():
           "канал подключён именно Бете, бот напоминает про её паузу", text)
     alpha, beta = await streamer("alpha_channel"), await streamer("beta_channel")
     check(vault.decrypt(beta.youtube_token.encode()) == b"RT-1" and beta.youtube_channel_id == "UC1"
-          and beta.consent_version == 3 and vault.decrypt(alpha.youtube_token.encode()) == b"RT-0"
+          and beta.consent_version == CONSENT_VERSION and vault.decrypt(alpha.youtube_token.encode()) == b"RT-0"
           and alpha.youtube_channel_id == "UC0",
           "токен и согласие записаны Бете, канал Альфы не тронут")
     _, text = await ask("/resume beta_channel", "обработка продолжена")
@@ -807,7 +809,8 @@ async def main():
     check(len(asked) == 1, "про остальных стримеров бот не спрашивает", len(asked))
     answer = await press(policy, "✅")
     beta = await streamer("beta_channel")
-    check(answer == "Принято" and beta.consent_version == 3 and beta.consent_prompted == 3, "согласие записано Бете")
+    check(answer == "Принято" and beta.consent_version == CONSENT_VERSION and beta.consent_prompted == CONSENT_VERSION,
+          "согласие записано Бете")
     async with db() as s:
         rows = {row.login: row for row in (await s.scalars(select(Streamer))).all()}
         legacy = [row.key for row in (await s.scalars(select(KV))).all() if row.key in ("paused", "watch_since")]

@@ -496,7 +496,7 @@ class FakeGoogle:
         if processed and b == "rejected":
             status.update(uploadStatus="rejected", rejectionReason="claim")
         if processed and (b == "blocked" or (b == "monitor_block" and v["published"])):
-            details["regionRestriction"] = {"blocked": ["DE", "US"]}
+            details["regionRestriction"] = {"blocked": ["DE", "US", "FR", "IT", "ES", "PL", "NL", "BE", "AT", "CH", "SE"]}
         return {"id": vid, "status": status, "contentDetails": details,
                 "processingDetails": {"processingStatus": "succeeded" if processed else "processing"}}
 
@@ -864,7 +864,7 @@ async def main():
           "после согласия опубликованный ролик попал в новый плейлист своей категории", jc_list)
 
     row = await wait_for(lambda: status_in(n_mc.id, finals), 600, "N.MC после перезапуска")
-    check(row.status == Status.REVIEW and any("заблокирован в 2 странах" in w for w in get_warnings(row)),
+    check(row.status == Status.REVIEW and any("заблокирован в 11 странах" in w for w in get_warnings(row)),
           "блокировка в странах → ролик ждёт решения", (row.status, get_warnings(row), row.error))
     mc_sessions = [v for v in google.sessions.values() if v["title"].startswith("Minecraft | ФРИКЛЕНД")]
     check(len(mc_sessions) == 1 and mc_sessions[0]["queries"] >= 3,
@@ -889,7 +889,7 @@ async def main():
 
     print("\n== 8. Наблюдение после публикации", flush=True)
     alert = await wait_for(lambda: tg.find(f"🔴 С опубликованным роликом «{n_jc.title[:30]}"), 60, "тревога после публикации")
-    check("заблокирован в 2 странах" in tg.messages[alert]["text"], "YouTube заблокировал ролик после публикации → 🔴")
+    check("заблокирован в 11 странах" in tg.messages[alert]["text"], "YouTube заблокировал ролик после публикации → 🔴")
     await asyncio.sleep(8)
     alerts = [mid for mid, m in tg.owner_messages() if m["text"].startswith(f"🔴 С опубликованным роликом «{n_jc.title[:30]}")]
     check(len(alerts) == 1, "о той же проблеме бот сообщает один раз", len(alerts))
