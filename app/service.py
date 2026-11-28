@@ -8,9 +8,11 @@ from html import escape
 
 from sqlalchemy import delete, func, select, update
 
+from . import analyst
 from .config import Settings
 from .context import App
 from .db import (
+    AiTask,
     Playlist,
     Segment,
     Status,
@@ -170,6 +172,8 @@ async def ingest_vod(app: App, info: VodInfo, login: str | None = None) -> int:
                 )
             )
         session.add_all(segments)
+        if analyst.enabled(settings) and any(reason is None for reason in reasons):
+            session.add(AiTask(vod_id=info.id))
 
     await app.notify(render_vod_header(vod, streamer, segments, app.tz, app.several), silent=True)
     for seg in segments:
@@ -178,6 +182,7 @@ async def ingest_vod(app: App, info: VodInfo, login: str | None = None) -> int:
         if message:
             await update_segment(app, seg.id, tg_message_id=message.message_id)
     app.wake.set()
+    app.ai_wake.set()
     return len(segments)
 
 

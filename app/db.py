@@ -165,6 +165,44 @@ class TitleChange(Base):
     title: Mapped[str] = mapped_column(Text)
 
 
+class AiTask(Base):
+    """Разбор записи нейросетями (analyst.py): ждёт, сделан или не получился."""
+
+    __tablename__ = "ai_tasks"
+
+    vod_id: Mapped[str] = mapped_column(ForeignKey("vods.id"), primary_key=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(default=0)
+    retry_at: Mapped[datetime | None]  # раньше этого времени не браться: сбой или исчерпан дневной лимит
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class AiResult(Base):
+    """Что нейросеть предложила для ролика."""
+
+    __tablename__ = "ai_results"
+
+    segment_id: Mapped[int] = mapped_column(ForeignKey("segments.id"), primary_key=True)
+    title: Mapped[str | None] = mapped_column(String(256))  # None — в ролике не нашлось речи
+    chapters: Mapped[str | None] = mapped_column(Text)  # строки для описания ролика
+    videos: Mapped[str | None] = mapped_column(Text)  # JSON [[start, end], …] — чужие видео, секунды записи
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class AiSpend(Base):
+    """Расход на нейросети: по нему считается дневной лимит."""
+
+    __tablename__ = "ai_spend"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    day: Mapped[str] = mapped_column(String(10), index=True)  # дата в часовом поясе владельца
+    vod_id: Mapped[str] = mapped_column(String(32), index=True)
+    kind: Mapped[str] = mapped_column(String(16))  # speech — распознавание, text — Claude
+    usd: Mapped[float]
+    at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
 class KV(Base):
     __tablename__ = "kv"
 

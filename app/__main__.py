@@ -13,6 +13,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from .analyst import Analyst
 from .bot import router
 from .checker import Checker
 from .config import Settings
@@ -80,6 +81,7 @@ async def main() -> None:
         app.spawn(Worker(app).run())
         app.spawn(Checker(app).run())
         app.spawn(Refresher(app).run())
+        app.spawn(Analyst(app).run())  # без ключей нейросетей просто ждёт
         # Shorts можно включить отдельному стримеру, поэтому клипы проверяются всегда
         app.spawn(ShortsScout(app).run())
         if settings.watch_interval_sec > 0:
