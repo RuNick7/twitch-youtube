@@ -76,6 +76,15 @@ class Settings(BaseSettings):
     # Как часто во время стрима запрашивать его название: смена названия — граница сегмента
     title_poll_sec: int = 60
 
+    # Нейросети в боте, режим наблюдения: после нарезки стрима бот присылает в Telegram предложенные названия и
+    # главы, а ролики не меняет. Работает, когда заданы ключ Anthropic и ключ распознавания (OpenRouter или Groq).
+    # Оценку расходов сверяем с ai_daily_limit_usd, остальное разбирается на следующий день
+    ai_observe: bool = True
+    ai_daily_limit_usd: float = 0.5
+    openrouter_api_key: str = ""
+    groq_api_key: str = ""
+    anthropic_api_key: str = ""
+
     # Короче min_segment_sec — приклеить к соседнему, короче skip_shorter_min — не загружать
     min_segment_sec: int = 120
     skip_shorter_min: int = 7
@@ -146,6 +155,7 @@ STREAMER_FIELDS = (
     "skip_title_categories",
     "skip_categories",
     "warn_categories",
+    "ai_observe",
 )
 _ADAPTERS = {name: TypeAdapter(Settings.model_fields[name].annotation) for name in STREAMER_FIELDS}
 

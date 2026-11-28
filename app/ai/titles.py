@@ -1,4 +1,5 @@
-"""Название ролика «Тема, тема, тема | Категория | Стример» из главных тем, которые Haiku возвращает вместе с главами.
+"""Название ролика «Тема, тема, тема | Категория #N | Стример» из главных тем, которые Haiku возвращает вместе
+с главами.
 
 Несколько тем по одному-два слова говорят о ролике больше, чем одна длинная фраза. Без подходящих тем берётся
 название стрима с Twitch, как сейчас у бота.
@@ -76,10 +77,21 @@ def headline(topics: Sequence[str], room: int) -> str:
 
 
 def compose(
-    topics: Sequence[object], stream_title: str, category: str, name: str, limit: int = TITLE_MAX_CHARS
+    topics: Sequence[object],
+    stream_title: str,
+    category: str,
+    name: str,
+    part: int | None = None,
+    limit: int = TITLE_MAX_CHARS,
 ) -> str:
-    """«Темы | Категория | Стример» не длиннее limit. Категория и стример обязательны."""
-    tail = TITLE_SEPARATOR.join(filter(None, (clean_line(category) or FALLBACK_CATEGORY, clean_line(name))))
+    """«Темы | Категория #N | Стример» не длиннее limit; part — номер части, если он есть у этой категории.
+
+    Категория, номер и стример обязательны.
+    """
+    section = clean_line(category) or FALLBACK_CATEGORY
+    if part:
+        section = f"{section} #{part}"
+    tail = TITLE_SEPARATOR.join(filter(None, (section, clean_line(name))))
     room = limit - len(tail) - len(TITLE_SEPARATOR)
     head = headline(pick_topics(topics, (category, name)), min(room, HEADLINE_MAX_CHARS))
     if not head and room >= MIN_ROOM:

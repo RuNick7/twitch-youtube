@@ -13,7 +13,7 @@ from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy import func, select
 
-from . import consent, limits, streamers
+from . import analyst, consent, limits, streamers
 from .config import describe_settings
 from .context import App
 from .db import (
@@ -86,6 +86,7 @@ HELP = (
     "/youtube [стример] — подключить YouTube-канал\n"
     "/disconnect [стример] — отключить YouTube-канал и удалить сохранённые о нём данные\n"
     "/status — состояние\n"
+    "/ai [ссылка на VOD] — нейросети: расход за сегодня или разобрать запись заново\n"
     "/pause [стример], /resume [стример] — остановить и продолжить загрузку и публикацию\n\n"
     "Стримера можно назвать логином, ссылкой на канал или именем. Пока стример один, его можно не указывать."
 )
@@ -164,6 +165,39 @@ async def process(message: Message, command: CommandObject, app: App) -> None:
         await progress.edit_text(f"🔴 Внутренняя ошибка: {escape(str(exc)[:300])}")
         return
     await progress.delete()
+
+
+@owner.message(Command("ai"))
+async def ai_command(message: Message, command: CommandObject, app: App) -> None:
+    if not (command.args or "").strip():
+        await message.answer(
+            f"{await analyst.status_text(app)}\n"
+            "Разобрать обработанную запись: /ai https://www.twitch.tv/videos/…"
+        )
+        return
+    vod_id = parse_vod_id(command.args)
+    if not vod_id:
+        await message.answer("Пришлите ссылку на VOD: /ai https://www.twitch.tv/videos/…")
+        return
+    async with app.sessions() as session:
+        vod = await session.get(Vod, vod_id)
+        streamer = await session.get(Streamer, vod.streamer_id) if vod else None
+    if vod is None:
+        await message.answer(f"Эта запись ещё не обработана. Сначала: /process https://www.twitch.tv/videos/{vod_id}")
+        return
+    if not analyst.enabled(app.config(streamer)):
+        reason = (
+            f"выключены для стримера (/set {escape(streamer.login)} ai_observe да)"
+            if analyst.has_keys(app.settings) and not app.config(streamer).ai_observe
+            else "выключены: проверьте ключи в .env и AI_DAILY_LIMIT_USD"
+        )
+        await message.answer(f"Нейросети {reason}.")
+        return
+    await analyst.queue(app, vod_id)
+    await message.answer(
+        "🤖 Разберу запись и пришлю предложения по каждому ролику. Ролики на YouTube не изменятся. "
+        "На несколько часов записи уходит 10–20 минут."
+    )
 
 
 # --- стримеры ---
@@ -727,6 +761,7 @@ async def show_status(message: Message, app: App) -> None:
     shown = [row for row in rows if row.removed_at is None or row.youtube_token]
     disk = shutil.disk_usage(app.settings.data_dir)
     common = [
+        await analyst.status_text(app),
         f"Диск: свободно {disk.free / 1024**3:.0f} из {disk.total / 1024**3:.0f} ГБ",
         f"yt-dlp: {escape(app.ytdlp_version)}",
     ]

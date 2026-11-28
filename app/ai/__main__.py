@@ -38,7 +38,7 @@ import httpx
 
 from .. import segments, tools
 from ..tools import ToolError
-from . import audio, claude, speech, timeline, titles, transcript
+from . import audio, claude, pipeline, speech, timeline, titles, transcript
 from . import chapters as video_chapters
 from .recognizer import SERVICES, Recognizer
 
@@ -168,19 +168,8 @@ async def run_analyze(args: argparse.Namespace) -> int:
                 row["skipped"] = f"нет расшифровки на этом участке (она есть только до {phrases[-1].end / 60:.0f}-й минуты)"
             else:
                 try:
-                    # У склеенного ролика отрезки разнесены по записи: каждый размечается отдельно,
-                    # иначе момент растянулся бы через то, что стояло между ними
-                    moments, transcribed = [], 0.0
-                    for a, b in seg.spans:
-                        piece = [p for p in inside if a <= p.start < b]
-                        if not piece:
-                            continue
-                        found, used = await timeline.analyze(piece, context, ask, minutes=args.window, effort=args.effort)
-                        usage.add(used)
-                        moments += found
-                        transcribed += piece[-1].end - piece[0].start
-                    parts, topics, used = await video_chapters.suggest(
-                        ask, category=seg.category, moments=moments, spans=seg.spans, effort=args.effort
+                    found, used = await pipeline.analyze_segment(
+                        ask, context, inside, category=seg.category, spans=seg.spans, window=args.window, effort=args.effort
                     )
                     usage.add(used)
                 except claude.ClaudeError as exc:
@@ -189,11 +178,11 @@ async def run_analyze(args: argparse.Namespace) -> int:
                     print(label, "\n  ОШИБКА:", exc)
                     break
                 row.update(
-                    moments=[asdict(m) for m in moments],
-                    chapters=[asdict(c) for c in parts],
-                    coverage=round(timeline.coverage(moments, 0, transcribed), 2),
-                    topics=titles.pick_topics(topics, (seg.category, name)),
-                    title=titles.compose(topics, stream_title, seg.category, name),
+                    moments=[asdict(m) for m in found.moments],
+                    chapters=[asdict(c) for c in found.chapters],
+                    coverage=round(timeline.coverage(found.moments, 0, found.transcribed), 2),
+                    topics=titles.pick_topics(found.topics, (seg.category, name)),
+                    title=titles.compose(found.topics, stream_title, seg.category, name),
                     title_now=segments.build_title(seg.category, stream_title, name),
                 )
         print(label, f"({row['minutes']} мин)")

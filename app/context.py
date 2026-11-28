@@ -35,6 +35,7 @@ class App:
     wake: asyncio.Event = field(default_factory=asyncio.Event)  # будит очередь загрузки
     sync_wake: asyncio.Event = field(default_factory=asyncio.Event)  # будит раскладку роликов по плейлистам
     shorts_wake: asyncio.Event = field(default_factory=asyncio.Event)  # будит проверку клипов для Shorts
+    ai_wake: asyncio.Event = field(default_factory=asyncio.Event)  # будит разбор записей нейросетями
     ytdlp_version: str = "?"
     # Для /status, по ID стримера: что видно на его канале и название идущего стрима, если он идёт
     watch_states: dict[int, str] = field(default_factory=dict)
