@@ -92,8 +92,9 @@ async def extract_chunks(
     folder.mkdir(parents=True, exist_ok=True)
     listing = folder / "chunks.csv"
     listing.unlink(missing_ok=True)
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     command = ffmpeg_command(
-        imageio_ffmpeg.get_ffmpeg_exe(), source, folder / "chunk-%03d.flac", listing,
+        ffmpeg, source, folder / "chunk-%03d.flac", listing,
         chunk_sec=chunk_sec, limit_sec=limit_sec, start_sec=start_sec,
     )
     code, _, err = await run(*command, timeout=EXTRACT_TIMEOUT_SEC)
@@ -102,4 +103,19 @@ async def extract_chunks(
     chunks = parse_listing(listing.read_text(), folder, start_sec)
     if not chunks:
         raise ToolError("в записи нет звука")
+    if len(chunks) > 1:
+        # При нарезке одним FLAC-кодировщиком ffmpeg записывает число сэмплов
+        # и контрольную сумму всего отрезка в заголовок последнего файла.
+        last = chunks[-1].path
+        repaired = last.with_suffix(".standalone.flac")
+        try:
+            code, _, err = await run(
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-xerror",
+                "-i", str(last), "-c:a", "flac", str(repaired), timeout=EXTRACT_TIMEOUT_SEC,
+            )
+            if code != 0:
+                raise ToolError(f"ffmpeg не смог пересобрать {last.name}: {err.strip()[-300:] or code}")
+            repaired.replace(last)
+        finally:
+            repaired.unlink(missing_ok=True)
     return chunks

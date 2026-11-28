@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -157,6 +158,36 @@ class AudioCommandTest(unittest.TestCase):
         self.assertEqual([(c.path.name, c.start, c.end) for c in chunks],
                          [("chunk-000.flac", 0.0, 600.0), ("chunk-001.flac", 600.0, 1200.01)])
         self.assertAlmostEqual(chunks[1].duration, 600.01)
+
+
+class AudioExtractionTest(unittest.IsolatedAsyncioTestCase):
+    async def test_last_flac_header_describes_only_its_chunk(self):
+        try:
+            import imageio_ffmpeg
+        except ImportError:
+            self.skipTest("нужен imageio-ffmpeg")
+
+        with tempfile.TemporaryDirectory() as folder:
+            playlist = Path(folder) / "source.m3u8"
+            code, _, err = await audio.run(
+                imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "sine=frequency=500:sample_rate=48000",
+                "-t", "5", "-c:a", "aac", "-f", "hls", "-hls_time", "2",
+                "-hls_playlist_type", "vod", str(playlist), timeout=20,
+            )
+            self.assertEqual(code, 0, err)
+            chunks = await audio.extract_chunks(str(playlist), Path(folder) / "audio", chunk_sec=2, limit_sec=3)
+            self.assertEqual(len(chunks), 2)
+            first, last = chunks
+            self.assertEqual(last.start, first.end)
+            with last.path.open("rb") as flac:
+                header = flac.read(42)
+            self.assertEqual(header[:4], b"fLaC")
+            stream_info = int.from_bytes(header[18:26], "big")
+            sample_rate = stream_info >> 44
+            samples = stream_info & ((1 << 36) - 1)
+            self.assertEqual(sample_rate, 16000)
+            self.assertAlmostEqual(samples / sample_rate, last.duration, delta=0.02)
 
 
 if __name__ == "__main__":
